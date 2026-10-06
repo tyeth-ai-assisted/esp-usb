@@ -38,7 +38,17 @@ typedef enum {
     PORT_ACTION_RECYCLE         = (1 << 2),     /**< Recycle port */
     PORT_ACTION_RESET           = (1 << 3),     /**< Reset port */
     PORT_ACTION_GET_STATUS      = (1 << 4),     /**< Get status request */
+    PORT_ACTION_POWER           = (1 << 5),     /**< User requested a port power change (see power_req) */
 } port_action_t;
+
+/**
+ * @brief User port power request
+ */
+typedef enum {
+    PORT_POWER_REQ_NONE = 0,
+    PORT_POWER_REQ_ON,
+    PORT_POWER_REQ_OFF,
+} port_power_req_t;
 
 /**
  * @brief State of the device, attached to the port
@@ -63,7 +73,8 @@ struct ext_port_s {
             uint32_t has_enum_device: 1;    /**< Port has an enumerated device */
             uint32_t waiting_recycle: 1;    /**< Port is waiting to be recycled */
             uint32_t waiting_free: 1;       /**< Port is waiting to be freed */
-            uint32_t reserved25: 25;        /**< Reserved */
+            uint32_t user_power_off: 1;     /**< Port has been powered off on user request and must stay off */
+            uint32_t reserved24: 24;        /**< Reserved */
         };
         uint32_t val;                       /**< Ports' flags value */
     } flags;                                /**< Ports' flags */
@@ -72,6 +83,7 @@ struct ext_port_s {
     usb_port_status_t status;               /**< Ports' status data */
     port_dev_state_t dev_state;             /**< Ports' device state */
     uint8_t dev_reset_attempts;             /**< Ports' device reset failure */
+    port_power_req_t power_req;             /**< Pending user power request */
 
     struct {
         // Port related constant members
@@ -530,7 +542,7 @@ static void handle_port_connection(ext_port_t *ext_port)
 
     switch (ext_port->state) {
     case USB_PORT_STATE_POWERED_OFF:
-        if (!port_is_powered(ext_port)) {
+        if (!port_is_powered(ext_port) && !ext_port->flags.user_power_off) {
             ext_port->state = USB_PORT_STATE_DISCONNECTED;
             port_set_feature(ext_port, USB_FEATURE_PORT_POWER);
         }
@@ -598,10 +610,12 @@ static bool handle_port_changes(ext_port_t *ext_port)
         need_processing = true;
     } else if (port_has_changed_from_enable(ext_port)) {
         // For more information, refer to section 11.8.1 Port Error of usb_2.0 specification
-        ESP_LOGE(EXT_PORT_TAG, "Port%d error: state=%d, dev=%d",
-                 ext_port->constant.port_num,
-                 ext_port->state,
-                 ext_port->dev_state == PORT_DEV_PRESENT);
+        // A port disables itself when its power is switched off on user request
+        ESP_LOG_LEVEL(ext_port->flags.user_power_off ? ESP_LOG_DEBUG : ESP_LOG_ERROR,
+                      EXT_PORT_TAG, "Port%d error: state=%d, dev=%d",
+                      ext_port->constant.port_num,
+                      ext_port->state,
+                      ext_port->dev_state == PORT_DEV_PRESENT);
         port_clear_feature(ext_port, USB_FEATURE_C_PORT_ENABLE);
         need_processing = true;
     } else if (port_has_finished_reset(ext_port)) {
@@ -633,6 +647,10 @@ static void handle_port_state(ext_port_t *ext_port)
         need_handling = true;
         break;
     case USB_PORT_STATE_POWERED_OFF:
+        if (ext_port->flags.user_power_off) {
+            // Port was switched off on user request, keep it unpowered
+            break;
+        }
         // Port power state depends on the wHubCharacteristics.power_switching
         new_state = USB_PORT_STATE_DISCONNECTED;
         port_set_feature(ext_port, USB_FEATURE_PORT_POWER);
@@ -798,7 +816,9 @@ static void handle_recycle(ext_port_t *ext_port)
         }
         break;
     default:
-        ext_port->state = USB_PORT_STATE_DISCONNECTED;
+        ext_port->state = ext_port->flags.user_power_off
+                          ? USB_PORT_STATE_POWERED_OFF
+                          : USB_PORT_STATE_DISCONNECTED;
         if (ext_port->flags.is_gone) {
             handle_complete(ext_port);
         } else {
@@ -848,6 +868,50 @@ static void handle_disable(ext_port_t *ext_port)
         // Port not gone, disable port
         port_clear_feature(ext_port, USB_FEATURE_PORT_ENABLE);
     }
+}
+
+/**
+ * @brief Port object handling user power action
+ *
+ * Powering off a port with a device propagates EXT_PORT_DISCONNECTED and waits
+ * for the port to be recycled, same as a physical disconnection. The port then
+ * stays in USB_PORT_STATE_POWERED_OFF until power is requested again.
+ *
+ * @param[in] ext_port  Port object
+ */
+static void handle_power(ext_port_t *ext_port)
+{
+    port_power_req_t req = ext_port->power_req;
+    ext_port->power_req = PORT_POWER_REQ_NONE;
+
+    ESP_LOGD(EXT_PORT_TAG, "Port%d user power %s (state=%d, dev=%d)",
+             ext_port->constant.port_num,
+             (req == PORT_POWER_REQ_ON) ? "on" : "off",
+             ext_port->state,
+             ext_port->dev_state);
+
+    if (req == PORT_POWER_REQ_OFF) {
+        ext_port->flags.user_power_off = 1;
+        if (ext_port->state != USB_PORT_STATE_POWERED_OFF) {
+            if (ext_port->dev_state == PORT_DEV_PRESENT) {
+                ext_port->dev_state = PORT_DEV_NOT_PRESENT;
+                ext_port->flags.waiting_recycle = 1;
+                port_event(ext_port, EXT_PORT_DISCONNECTED);
+            }
+            ext_port->state = USB_PORT_STATE_POWERED_OFF;
+            port_clear_feature(ext_port, USB_FEATURE_PORT_POWER);
+            return;
+        }
+    } else if (req == PORT_POWER_REQ_ON) {
+        ext_port->flags.user_power_off = 0;
+        if (ext_port->state == USB_PORT_STATE_POWERED_OFF) {
+            ext_port->state = USB_PORT_STATE_DISCONNECTED;
+            port_set_feature(ext_port, USB_FEATURE_PORT_POWER);
+            return;
+        }
+    }
+    // Nothing to change, complete the handling
+    handle_port(ext_port);
 }
 
 // -----------------------------------------------------------------------------
@@ -1213,6 +1277,35 @@ static esp_err_t port_req_process(void *port_hdl)
     return ESP_OK;
 }
 
+/**
+ * @brief Request the port power to be switched on or off
+ *
+ * @note This function should only be called from the External Hub Driver, while
+ *       no other port is being handled
+ *
+ * @param[in] port_hdl  Port object handle
+ * @param[in] enable    true to power the port on, false to power it off
+ * @return
+ *    - ESP_ERR_NOT_ALLOWED:    The External Port Driver has not been installed
+ *    - ESP_ERR_INVALID_ARG:    The port handle can't be NULL
+ *    - ESP_ERR_INVALID_STATE:  The port is gone, being configured or reset
+ *    - ESP_OK:                 Port power change requested
+ */
+static esp_err_t port_power(void *port_hdl, bool enable)
+{
+    EXT_PORT_CHECK(p_ext_port_driver != NULL, ESP_ERR_NOT_ALLOWED);
+    EXT_PORT_CHECK(port_hdl != NULL, ESP_ERR_INVALID_ARG);
+    ext_port_t *ext_port = (ext_port_t *)port_hdl;
+
+    EXT_PORT_CHECK(ext_port->flags.is_gone == 0, ESP_ERR_INVALID_STATE);
+    EXT_PORT_CHECK(ext_port->state != USB_PORT_STATE_NOT_CONFIGURED &&
+                   ext_port->state != USB_PORT_STATE_RESETTING, ESP_ERR_INVALID_STATE);
+
+    ext_port->power_req = enable ? PORT_POWER_REQ_ON : PORT_POWER_REQ_OFF;
+    port_set_actions(ext_port, PORT_ACTION_POWER);
+    return ESP_OK;
+}
+
 // -----------------------------------------------------------------------------
 // ------------------ External Port Processing Functions -----------------------
 // -----------------------------------------------------------------------------
@@ -1232,6 +1325,7 @@ const ext_port_driver_api_t ext_port_driver = {
     .get_status = port_get_status,
     .set_status = port_set_status,
     .req_process = port_req_process,
+    .power = port_power,
 };
 
 esp_err_t ext_port_install(const ext_port_driver_config_t *config)
@@ -1312,6 +1406,8 @@ esp_err_t ext_port_process(void)
         */
         if (action_flags & PORT_ACTION_GET_STATUS) {
             port_request_status(ext_port);
+        } else if (action_flags & PORT_ACTION_POWER) {
+            handle_power(ext_port);
         } else if (action_flags & PORT_ACTION_RESET) {
             if (ext_port->state != USB_PORT_STATE_RESETTING) {
                 /*
@@ -1354,5 +1450,21 @@ esp_err_t ext_port_get_port_num(ext_port_hdl_t port_hdl, uint8_t *port1)
     EXT_PORT_CHECK(port_hdl != NULL && port1 != NULL, ESP_ERR_INVALID_ARG);
     ext_port_t *ext_port = (ext_port_t *)port_hdl;
     *port1 = ext_port->constant.port_num;
+    return ESP_OK;
+}
+
+bool ext_port_has_pending(void)
+{
+    EXT_PORT_CHECK(p_ext_port_driver != NULL, false);
+    return !TAILQ_EMPTY(&p_ext_port_driver->single_thread.pending_tailq);
+}
+
+esp_err_t ext_port_get_info(ext_port_hdl_t port_hdl, usb_port_status_t *status, bool *user_power_off)
+{
+    EXT_PORT_CHECK(p_ext_port_driver != NULL, ESP_ERR_NOT_ALLOWED);
+    EXT_PORT_CHECK(port_hdl != NULL && status != NULL && user_power_off != NULL, ESP_ERR_INVALID_ARG);
+    ext_port_t *ext_port = (ext_port_t *)port_hdl;
+    *status = ext_port->status;
+    *user_power_off = ext_port->flags.user_power_off;
     return ESP_OK;
 }

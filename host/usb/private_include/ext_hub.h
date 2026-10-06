@@ -14,6 +14,7 @@
 #include "usb/usb_types_ch9.h"
 #include "usb/usb_types_ch11.h"
 #include "ext_port.h"
+#include "usb/usb_host_hub.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -96,6 +97,14 @@ void *ext_hub_get_client(void);
  *    - ESP_OK if the speed was obtained
  */
 esp_err_t ext_hub_get_speed(ext_hub_handle_t ext_hub_hdl, usb_speed_t *speed);
+
+/**
+ * @brief Returns the USBH device handle of the External Hub
+ *
+ * @param[in] ext_hub_hdl External Hub handle
+ * @return Device handle, NULL if the hub is not known
+ */
+usb_device_handle_t ext_hub_get_dev_hdl(ext_hub_handle_t ext_hub_hdl);
 
 /**
  * @brief Get the root port handle of an External Hub device
@@ -275,6 +284,33 @@ esp_err_t ext_hub_port_get_speed(ext_hub_handle_t ext_hub_hdl, uint8_t port_num,
  *    - ESP_ERR_NOT_SUPPORTED if the request is not supported
  *    - ESP_OK if control transfer was successfully submitted
  */
+/**
+ * @brief Get information about a configured external hub
+ *
+ * @note Must be called from the USB Host processing task
+ */
+esp_err_t ext_hub_user_get_info(uint8_t dev_addr, usb_host_hub_info_t *info);
+
+/**
+ * @brief Get the last known status of a port of a configured external hub
+ *
+ * @note Must be called from the USB Host processing task
+ */
+esp_err_t ext_hub_user_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_host_hub_port_info_t *info);
+
+/**
+ * @brief Switch the power of a port of a configured external hub
+ *
+ * @note Must be called from the USB Host processing task
+ *
+ * @return
+ *    - ESP_ERR_NOT_FINISHED:   The hub is busy handling ports, retry later
+ *    - ESP_ERR_INVALID_STATE:  The hub is not configured or the port is being reset
+ *    - ESP_ERR_INVALID_SIZE:   Port number out of range
+ *    - ESP_OK:                 Power change started
+ */
+esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable);
+
 esp_err_t ext_hub_request(ext_port_hdl_t port_hdl, ext_port_parent_request_data_t *data, void *user_arg);
 
 #ifdef __cplusplus

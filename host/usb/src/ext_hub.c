@@ -119,6 +119,9 @@ struct ext_hub_s {
         ext_hub_stage_t stage;                      /**< Device's stage */
         uint8_t maxchild;                           /**< Amount of allocated ports. Could be 0 for some Hubs. Is increased when new port is added and decreased when port has been freed. */
         ext_hub_state_t state;                      /**< Device's state */
+        bool in_ep_armed;                           /**< Interrupt IN URB is enqueued */
+        bool user_op;                               /**< A user requested port operation is being handled */
+        uint32_t deferred_status;                   /**< Status change bitmap received during a user operation */
     } single_thread;                                /**< Single thread members don't require a critical section, as long as they are never accessed from multiple threads */
 
     struct {
@@ -261,6 +264,7 @@ static void interrupt_transfer_complete_cb(usb_transfer_t *intr_xfer)
     assert(intr_xfer);
     ext_hub_dev_t *ext_hub_dev = (ext_hub_dev_t *)intr_xfer->context;
     assert(ext_hub_dev);
+    ext_hub_dev->single_thread.in_ep_armed = false;
 
     switch (intr_xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED:
@@ -310,6 +314,8 @@ static bool _device_set_actions(ext_hub_dev_t *ext_hub_dev, uint32_t action_flag
     return call_proc_req_cb;
 }
 
+static void device_status_bitmap_handle(ext_hub_dev_t *ext_hub_dev, uint32_t device_status, const int length);
+
 static esp_err_t device_enable_int_ep(ext_hub_dev_t *ext_hub_dev)
 {
     bool call_proc_req_cb = false;
@@ -325,9 +331,25 @@ static esp_err_t device_enable_int_ep(ext_hub_dev_t *ext_hub_dev)
     EXT_HUB_EXIT_CRITICAL();
 
     if (is_active) {
+        if (ext_hub_dev->single_thread.user_op) {
+            ext_hub_dev->single_thread.user_op = false;
+            uint32_t deferred = ext_hub_dev->single_thread.deferred_status;
+            ext_hub_dev->single_thread.deferred_status = 0;
+            if (deferred) {
+                // Handle the changes the hub reported during the user operation
+                device_status_bitmap_handle(ext_hub_dev, deferred, EXT_HUB_MAX_STATUS_BYTES_SIZE);
+                return ESP_OK;
+            }
+        }
+        if (ext_hub_dev->single_thread.in_ep_armed) {
+            // A user operation completed while the hub was idle, IN EP is still waiting
+            return ESP_OK;
+        }
         ESP_LOGD(EXT_HUB_TAG, "[%d] Enable IN EP", ext_hub_dev->constant.dev_addr);
+        ext_hub_dev->single_thread.in_ep_armed = true;
         esp_err_t ret = usbh_ep_enqueue_urb(ext_hub_dev->constant.ep_in_hdl, ext_hub_dev->constant.in_urb);
         if (ret != ESP_OK) {
+            ext_hub_dev->single_thread.in_ep_armed = false;
             ESP_LOGE(EXT_HUB_TAG, "[%d] Failed to submit in urb: %s", ext_hub_dev->constant.dev_addr, esp_err_to_name(ret));
             device_error(ext_hub_dev);
         }
@@ -361,6 +383,8 @@ static void device_has_changed(ext_hub_dev_t *ext_hub_dev)
 //           |                             ...
 //           +---------------------------- Port N change detected
 //
+static void device_status_bitmap_handle(ext_hub_dev_t *ext_hub_dev, uint32_t device_status, const int length);
+
 static void device_status_change_handle(ext_hub_dev_t *ext_hub_dev, const uint8_t *data, const int length)
 {
     uint32_t device_status = 0;
@@ -368,9 +392,20 @@ static void device_status_change_handle(ext_hub_dev_t *ext_hub_dev, const uint8_
     assert(length <= EXT_HUB_MAX_STATUS_BYTES_SIZE);
 
     for (uint32_t i = 0; i < length; i++) {
-        device_status |= (uint32_t)(data[i] << i);
+        device_status |= (uint32_t)data[i] << (8 * i);
     }
 
+    if (ext_hub_dev->single_thread.user_op) {
+        // A user requested port operation owns the control pipe. Handle the
+        // changes once it completes (see device_enable_int_ep()).
+        ext_hub_dev->single_thread.deferred_status |= device_status;
+        return;
+    }
+    device_status_bitmap_handle(ext_hub_dev, device_status, length);
+}
+
+static void device_status_bitmap_handle(ext_hub_dev_t *ext_hub_dev, uint32_t device_status, const int length)
+{
     if (device_status) {
         // If device has a status change, we will re-trigger back the transfer
         // after all handling will be done
@@ -381,7 +416,7 @@ static void device_status_change_handle(ext_hub_dev_t *ext_hub_dev, const uint8_
         // HINTs:
         // - every byte of Data IN has 8 bits of possible port statuses bits: (length * 8)
         // - very first bit of status is used for Hub status: (length * 8) - 1
-        for (uint8_t i = 0; i < (length * 8) - 1; i++) {
+        for (uint8_t i = 0; i < (length * 8) - 1 && i < ext_hub_dev->single_thread.maxchild; i++) {
             // Check ports statuses
             if (device_status & (EXT_HUB_STATUS_PORT1_CHANGE_FLAG << i)) {
                 assert(i < ext_hub_dev->single_thread.maxchild);        // Port should be in range
@@ -1320,6 +1355,13 @@ esp_err_t ext_hub_get_speed(ext_hub_handle_t ext_hub_hdl, usb_speed_t *speed)
     return ESP_OK;
 }
 
+usb_device_handle_t ext_hub_get_dev_hdl(ext_hub_handle_t ext_hub_hdl)
+{
+    EXT_HUB_CHECK(ext_hub_hdl != NULL, NULL);
+    EXT_HUB_CHECK(dev_is_in_list(ext_hub_hdl), NULL);
+    return ((ext_hub_dev_t *)ext_hub_hdl)->constant.dev_hdl;
+}
+
 hcd_port_handle_t ext_hub_get_root_port(ext_hub_handle_t ext_hub_hdl)
 {
     EXT_HUB_CHECK(ext_hub_hdl != NULL, NULL);
@@ -1769,4 +1811,93 @@ esp_err_t ext_hub_request(ext_port_hdl_t port_hdl, ext_port_parent_request_data_
 
     ESP_LOGE(EXT_HUB_TAG, "Request type %d not supported", data->type);
     return ESP_ERR_NOT_SUPPORTED;
+}
+
+// -------------------------------------------------------------------------------------------------
+// ---------------------------------- User port control --------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+static esp_err_t user_get_configured_hub(uint8_t dev_addr, ext_hub_dev_t **ext_hub_dev)
+{
+    EXT_HUB_ENTER_CRITICAL();
+    EXT_HUB_CHECK_FROM_CRIT(p_ext_hub_driver != NULL, ESP_ERR_NOT_ALLOWED);
+    EXT_HUB_EXIT_CRITICAL();
+
+    esp_err_t ret = get_dev_by_addr(dev_addr, ext_hub_dev);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    EXT_HUB_CHECK((*ext_hub_dev)->single_thread.state == EXT_HUB_STATE_CONFIGURED, ESP_ERR_INVALID_STATE);
+    EXT_HUB_CHECK((*ext_hub_dev)->constant.hub_desc != NULL, ESP_ERR_INVALID_STATE);
+    return ESP_OK;
+}
+
+esp_err_t ext_hub_user_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
+{
+    EXT_HUB_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
+    ext_hub_dev_t *ext_hub_dev = NULL;
+    esp_err_t ret = user_get_configured_hub(dev_addr, &ext_hub_dev);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    const usb_hub_descriptor_t *desc = ext_hub_dev->constant.hub_desc;
+    info->dev_addr = dev_addr;
+    info->num_ports = ext_hub_dev->single_thread.maxchild;
+    info->power_switching = desc->wHubCharacteristics.power_switching;
+    info->compound = desc->wHubCharacteristics.compound;
+    info->over_current_protection = desc->wHubCharacteristics.ovr_current_protect;
+    info->pwr_on_to_pwr_good_ms = (uint16_t)desc->bPwrOn2PwrGood * 2;
+    return ESP_OK;
+}
+
+esp_err_t ext_hub_user_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_host_hub_port_info_t *info)
+{
+    EXT_HUB_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
+    ext_hub_dev_t *ext_hub_dev = NULL;
+    esp_err_t ret = user_get_configured_hub(dev_addr, &ext_hub_dev);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    EXT_HUB_CHECK(port_num != 0 && port_num <= ext_hub_dev->single_thread.maxchild, ESP_ERR_INVALID_SIZE);
+    ext_port_hdl_t port_hdl = ext_hub_dev->constant.ports[port_num - 1];
+    EXT_HUB_CHECK(port_hdl != NULL, ESP_ERR_INVALID_STATE);
+
+    usb_port_status_t status;
+    bool user_power_off = false;
+    ret = ext_port_get_info(port_hdl, &status, &user_power_off);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    info->port_status = status.wPortStatus.val;
+    info->port_change = status.wPortChange.val;
+    info->user_power_off = user_power_off;
+    return ESP_OK;
+}
+
+esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable)
+{
+    ext_hub_dev_t *ext_hub_dev = NULL;
+    esp_err_t ret = user_get_configured_hub(dev_addr, &ext_hub_dev);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    EXT_HUB_CHECK(port_num != 0 && port_num <= ext_hub_dev->single_thread.maxchild, ESP_ERR_INVALID_SIZE);
+    EXT_HUB_CHECK(p_ext_hub_driver->constant.port_driver != NULL &&
+                  p_ext_hub_driver->constant.port_driver->power != NULL, ESP_ERR_NOT_SUPPORTED);
+    ext_port_hdl_t port_hdl = ext_hub_dev->constant.ports[port_num - 1];
+    EXT_HUB_CHECK(port_hdl != NULL, ESP_ERR_INVALID_STATE);
+
+    // The control pipe of the hub must be idle: no port of any hub being handled
+    if (ext_hub_dev->single_thread.user_op ||
+            ext_hub_dev->single_thread.stage != EXT_HUB_STAGE_IDLE ||
+            ext_port_has_pending()) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+
+    ext_hub_dev->single_thread.user_op = true;
+    ret = p_ext_hub_driver->constant.port_driver->power(port_hdl, enable);
+    if (ret != ESP_OK) {
+        ext_hub_dev->single_thread.user_op = false;
+    }
+    return ret;
 }

@@ -13,10 +13,13 @@
 #include "esp_bit_defs.h"
 #include "esp_private/critical_section.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "usb_private.h"
 #include "hcd.h"
 #include "hub.h"
 #include "usbh.h"
+#include "usb/usb_host_hub.h"
 
 #if ENABLE_USB_HUBS
 #include "ext_hub.h"
@@ -54,10 +57,41 @@ typedef enum {
     HUB_DRIVER_ACTION_ROOT1_REQ           = BIT3,
 #endif // HCD_NUM_PORTS > 1
 #if ENABLE_USB_HUBS
+    HUB_DRIVER_ACTION_USER_REQ            = BIT5,
     HUB_DRIVER_ACTION_EXT_HUB             = BIT6,
     HUB_DRIVER_ACTION_EXT_PORT            = BIT7
 #endif // ENABLE_USB_HUBS
 } hub_flag_action_t;
+
+#if ENABLE_USB_HUBS
+/**
+ * @brief User request to an external hub, handed from the caller's task to hub_process()
+ */
+typedef enum {
+    HUB_USER_REQ_INFO,
+    HUB_USER_REQ_PORT_INFO,
+    HUB_USER_REQ_PORT_POWER,
+} hub_user_req_type_t;
+
+typedef struct {
+    SemaphoreHandle_t mutex;            /**< Serialises callers */
+    StaticSemaphore_t mutex_buf;
+    SemaphoreHandle_t done;             /**< Given by hub_process() when the request is handled */
+    StaticSemaphore_t done_buf;
+    bool pending;                       /**< Request waiting for hub_process(). Requires a critical section */
+    hub_user_req_type_t type;
+    uint8_t dev_addr;
+    uint8_t port_num;
+    bool enable;
+    esp_err_t ret;
+    union {
+        usb_host_hub_info_t hub_info;
+        usb_host_hub_port_info_t port_info;
+    } result;
+} hub_user_req_t;
+
+static hub_user_req_t s_user_req;
+#endif // ENABLE_USB_HUBS
 
 /**
  * @brief Root port states
@@ -229,7 +263,11 @@ static esp_err_t dev_tree_node_new(ext_hub_handle_t parent, uint8_t port_num, us
         .speed = speed,
         .root_port_hdl = root_port_hdl,
         // TODO: IDF-10023 Move parent-child tree management responsibility to Hub Driver
+#ifdef ENABLE_USB_HUBS
+        .parent_dev_hdl = (parent != NULL) ? ext_hub_get_dev_hdl(parent) : NULL,
+#else
         .parent_dev_hdl = NULL,
+#endif // ENABLE_USB_HUBS
         .parent_port_num = port_num,
     };
 
@@ -723,6 +761,10 @@ esp_err_t hub_install(hub_config_t *hub_config, void **client_ret)
         goto err_ext_hub;
     }
     *client_ret = ext_hub_get_client();
+    if (s_user_req.mutex == NULL) {
+        s_user_req.mutex = xSemaphoreCreateMutexStatic(&s_user_req.mutex_buf);
+        s_user_req.done = xSemaphoreCreateBinaryStatic(&s_user_req.done_buf);
+    }
 #else
     *client_ret = NULL;
 #endif // ENABLE_USB_HUBS
@@ -1204,6 +1246,111 @@ esp_err_t hub_notify_all_free(void)
 }
 #endif // ENABLE_USB_HUBS
 
+#if ENABLE_USB_HUBS
+static void hub_user_req_process(void)
+{
+    HUB_DRIVER_ENTER_CRITICAL();
+    bool pending = s_user_req.pending;
+    HUB_DRIVER_EXIT_CRITICAL();
+    if (!pending) {
+        // Caller gave up waiting
+        return;
+    }
+
+    esp_err_t ret;
+    switch (s_user_req.type) {
+    case HUB_USER_REQ_INFO:
+        ret = ext_hub_user_get_info(s_user_req.dev_addr, &s_user_req.result.hub_info);
+        break;
+    case HUB_USER_REQ_PORT_INFO:
+        ret = ext_hub_user_get_port_info(s_user_req.dev_addr, s_user_req.port_num, &s_user_req.result.port_info);
+        break;
+    case HUB_USER_REQ_PORT_POWER:
+        ret = ext_hub_user_port_power(s_user_req.dev_addr, s_user_req.port_num, s_user_req.enable);
+        break;
+    default:
+        ret = ESP_ERR_NOT_SUPPORTED;
+        break;
+    }
+
+    HUB_DRIVER_ENTER_CRITICAL();
+    if (s_user_req.pending) {
+        s_user_req.pending = false;
+        s_user_req.ret = ret;
+        HUB_DRIVER_EXIT_CRITICAL();
+        xSemaphoreGive(s_user_req.done);
+    } else {
+        HUB_DRIVER_EXIT_CRITICAL();
+    }
+}
+
+#define HUB_USER_REQ_TIMEOUT_MS         1000
+#define HUB_USER_REQ_BUSY_RETRY_MS      20
+#define HUB_USER_REQ_BUSY_TIMEOUT_MS    3000
+
+static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, uint8_t port_num, bool enable, void *out)
+{
+    HUB_DRIVER_ENTER_CRITICAL();
+    HUB_DRIVER_CHECK_FROM_CRIT(p_hub_driver_obj != NULL, ESP_ERR_INVALID_STATE);
+    HUB_DRIVER_EXIT_CRITICAL();
+    HUB_DRIVER_CHECK(s_user_req.mutex != NULL, ESP_ERR_INVALID_STATE);
+
+    xSemaphoreTake(s_user_req.mutex, portMAX_DELAY);
+    esp_err_t ret = ESP_ERR_TIMEOUT;
+    TickType_t busy_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(HUB_USER_REQ_BUSY_TIMEOUT_MS);
+    while (true) {
+        // Drop a completion left over from a request that timed out
+        xSemaphoreTake(s_user_req.done, 0);
+
+        HUB_DRIVER_ENTER_CRITICAL();
+        if (p_hub_driver_obj == NULL) {
+            HUB_DRIVER_EXIT_CRITICAL();
+            ret = ESP_ERR_INVALID_STATE;
+            break;
+        }
+        s_user_req.type = type;
+        s_user_req.dev_addr = dev_addr;
+        s_user_req.port_num = port_num;
+        s_user_req.enable = enable;
+        s_user_req.pending = true;
+        p_hub_driver_obj->dynamic.flags.actions |= HUB_DRIVER_ACTION_USER_REQ;
+        HUB_DRIVER_EXIT_CRITICAL();
+        p_hub_driver_obj->constant.proc_req_cb(USB_PROC_REQ_SOURCE_HUB, false, p_hub_driver_obj->constant.proc_req_cb_arg);
+
+        if (xSemaphoreTake(s_user_req.done, pdMS_TO_TICKS(HUB_USER_REQ_TIMEOUT_MS)) != pdTRUE) {
+            HUB_DRIVER_ENTER_CRITICAL();
+            bool still_pending = s_user_req.pending;
+            s_user_req.pending = false;
+            HUB_DRIVER_EXIT_CRITICAL();
+            if (still_pending) {
+                ret = ESP_ERR_TIMEOUT;
+                break;
+            }
+            // Completed just after the timeout
+            xSemaphoreTake(s_user_req.done, portMAX_DELAY);
+        }
+        ret = s_user_req.ret;
+        if (ret != ESP_ERR_NOT_FINISHED || xTaskGetTickCount() >= busy_deadline) {
+            break;
+        }
+        // Hub is busy handling ports, try again shortly
+        vTaskDelay(pdMS_TO_TICKS(HUB_USER_REQ_BUSY_RETRY_MS));
+    }
+    if (ret == ESP_ERR_NOT_FINISHED) {
+        ret = ESP_ERR_TIMEOUT;
+    }
+    if (ret == ESP_OK && out != NULL) {
+        if (type == HUB_USER_REQ_INFO) {
+            *(usb_host_hub_info_t *)out = s_user_req.result.hub_info;
+        } else if (type == HUB_USER_REQ_PORT_INFO) {
+            *(usb_host_hub_port_info_t *)out = s_user_req.result.port_info;
+        }
+    }
+    xSemaphoreGive(s_user_req.mutex);
+    return ret;
+}
+#endif // ENABLE_USB_HUBS
+
 esp_err_t hub_process(void)
 {
     HUB_DRIVER_ENTER_CRITICAL();
@@ -1213,6 +1360,9 @@ esp_err_t hub_process(void)
 
     while (action_flags) {
 #if ENABLE_USB_HUBS
+        if (action_flags & HUB_DRIVER_ACTION_USER_REQ) {
+            hub_user_req_process();
+        }
         if (action_flags & HUB_DRIVER_ACTION_EXT_PORT) {
             ESP_ERROR_CHECK(ext_port_process());
         }
@@ -1241,4 +1391,37 @@ esp_err_t hub_process(void)
     }
 
     return ESP_OK;
+}
+
+// -------------------------------------------------------------------------------------------------
+// ------------------------------------ Public hub API ---------------------------------------------
+// -------------------------------------------------------------------------------------------------
+
+esp_err_t usb_host_hub_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
+{
+#if ENABLE_USB_HUBS
+    HUB_DRIVER_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
+    return hub_user_request(HUB_USER_REQ_INFO, dev_addr, 0, false, info);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
+}
+
+esp_err_t usb_host_hub_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_host_hub_port_info_t *info)
+{
+#if ENABLE_USB_HUBS
+    HUB_DRIVER_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
+    return hub_user_request(HUB_USER_REQ_PORT_INFO, dev_addr, port_num, false, info);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
+}
+
+esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enable)
+{
+#if ENABLE_USB_HUBS
+    return hub_user_request(HUB_USER_REQ_PORT_POWER, dev_addr, port_num, enable, NULL);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
 }

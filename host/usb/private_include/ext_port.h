@@ -38,6 +38,7 @@ typedef struct {
     esp_err_t (*get_status)(void *port_hdl);
     esp_err_t (*set_status)(void *port_hdl, const usb_port_status_t *status);
     esp_err_t (*req_process)(void *port_hdl);
+    esp_err_t (*power)(void *port_hdl, bool enable);
 } ext_port_driver_api_t;
 
 // ------------------------------ Events ---------------------------------------
@@ -181,6 +182,30 @@ void *ext_port_get_context(ext_port_hdl_t port_hdl);
  *    - ESP_ERR_INVALID_ARG if the Port handle is NULL
  *    - ESP_OK if the port number was successfully returned
  */
+/**
+ * @brief Whether any port is waiting to be handled
+ *
+ * @note Must be called from the USB Host processing task
+ *
+ * @return true if at least one port is in the pending list
+ */
+bool ext_port_has_pending(void);
+
+/**
+ * @brief Get the last known status of the port
+ *
+ * @note Must be called from the USB Host processing task
+ *
+ * @param[in] port_hdl          Port object handle
+ * @param[out] status           Last port status reported by the parent hub
+ * @param[out] user_power_off   Port has been powered off on user request
+ * @return
+ *    - ESP_ERR_NOT_ALLOWED:    The External Port Driver has not been installed
+ *    - ESP_ERR_INVALID_ARG:    Arguments can't be NULL
+ *    - ESP_OK:                 Status returned
+ */
+esp_err_t ext_port_get_info(ext_port_hdl_t port_hdl, usb_port_status_t *status, bool *user_power_off);
+
 esp_err_t ext_port_get_port_num(ext_port_hdl_t port_hdl, uint8_t *port1);
 
 #ifdef __cplusplus
