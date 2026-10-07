@@ -1324,8 +1324,6 @@ static void hub_user_req_process(void)
 }
 
 #define HUB_USER_REQ_TIMEOUT_MS         1000
-#define HUB_USER_REQ_BUSY_RETRY_MS      20
-#define HUB_USER_REQ_BUSY_TIMEOUT_MS    3000
 
 static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, uint8_t port_num, bool enable,
                                   uint32_t flags, void *out)
@@ -1335,50 +1333,43 @@ static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, ui
     HUB_DRIVER_EXIT_CRITICAL();
     HUB_DRIVER_CHECK(s_user_req.mutex != NULL, ESP_ERR_INVALID_STATE);
 
+    // The mutex is only held for one round trip to the USB Host Library task
+    // (no retries): a busy port must not hold up requests for other ports or hubs
     xSemaphoreTake(s_user_req.mutex, portMAX_DELAY);
-    esp_err_t ret = ESP_ERR_TIMEOUT;
-    TickType_t busy_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(HUB_USER_REQ_BUSY_TIMEOUT_MS);
-    while (true) {
-        // Drop a completion left over from a request that timed out
-        xSemaphoreTake(s_user_req.done, 0);
+    esp_err_t ret;
+    // Drop a completion left over from a request that timed out
+    xSemaphoreTake(s_user_req.done, 0);
 
-        HUB_DRIVER_ENTER_CRITICAL();
-        if (p_hub_driver_obj == NULL) {
-            HUB_DRIVER_EXIT_CRITICAL();
-            ret = ESP_ERR_INVALID_STATE;
-            break;
-        }
-        s_user_req.type = type;
-        s_user_req.dev_addr = dev_addr;
-        s_user_req.port_num = port_num;
-        s_user_req.enable = enable;
-        s_user_req.flags = flags;
-        s_user_req.pending = true;
-        p_hub_driver_obj->dynamic.flags.actions |= HUB_DRIVER_ACTION_USER_REQ;
+    HUB_DRIVER_ENTER_CRITICAL();
+    if (p_hub_driver_obj == NULL) {
         HUB_DRIVER_EXIT_CRITICAL();
-        p_hub_driver_obj->constant.proc_req_cb(USB_PROC_REQ_SOURCE_HUB, false, p_hub_driver_obj->constant.proc_req_cb_arg);
+        xSemaphoreGive(s_user_req.mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_user_req.type = type;
+    s_user_req.dev_addr = dev_addr;
+    s_user_req.port_num = port_num;
+    s_user_req.enable = enable;
+    s_user_req.flags = flags;
+    s_user_req.pending = true;
+    p_hub_driver_obj->dynamic.flags.actions |= HUB_DRIVER_ACTION_USER_REQ;
+    HUB_DRIVER_EXIT_CRITICAL();
+    p_hub_driver_obj->constant.proc_req_cb(USB_PROC_REQ_SOURCE_HUB, false, p_hub_driver_obj->constant.proc_req_cb_arg);
 
-        if (xSemaphoreTake(s_user_req.done, pdMS_TO_TICKS(HUB_USER_REQ_TIMEOUT_MS)) != pdTRUE) {
-            HUB_DRIVER_ENTER_CRITICAL();
-            bool still_pending = s_user_req.pending;
-            s_user_req.pending = false;
-            HUB_DRIVER_EXIT_CRITICAL();
-            if (still_pending) {
-                ret = ESP_ERR_TIMEOUT;
-                break;
-            }
+    if (xSemaphoreTake(s_user_req.done, pdMS_TO_TICKS(HUB_USER_REQ_TIMEOUT_MS)) == pdTRUE) {
+        ret = s_user_req.ret;
+    } else {
+        HUB_DRIVER_ENTER_CRITICAL();
+        bool still_pending = s_user_req.pending;
+        s_user_req.pending = false;
+        HUB_DRIVER_EXIT_CRITICAL();
+        if (still_pending) {
+            ret = ESP_ERR_TIMEOUT;
+        } else {
             // Completed just after the timeout
             xSemaphoreTake(s_user_req.done, portMAX_DELAY);
+            ret = s_user_req.ret;
         }
-        ret = s_user_req.ret;
-        if (ret != ESP_ERR_NOT_FINISHED || xTaskGetTickCount() >= busy_deadline) {
-            break;
-        }
-        // Hub is busy handling ports, try again shortly
-        vTaskDelay(pdMS_TO_TICKS(HUB_USER_REQ_BUSY_RETRY_MS));
-    }
-    if (ret == ESP_ERR_NOT_FINISHED) {
-        ret = ESP_ERR_TIMEOUT;
     }
     if (ret == ESP_OK && out != NULL) {
         if (type == HUB_USER_REQ_SNAPSHOT) {

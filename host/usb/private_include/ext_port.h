@@ -194,6 +194,13 @@ void *ext_port_get_context(ext_port_hdl_t port_hdl);
 bool ext_port_has_pending(void *context);
 
 /**
+ * @brief Whether the port is being handled (in the pending list)
+ *
+ * @note Must be called from the USB Host processing task
+ */
+bool ext_port_is_pending(ext_port_hdl_t port_hdl);
+
+/**
  * @brief Log the ports waiting to be handled (diagnostics)
  */
 void ext_port_debug_dump(void);

@@ -2005,17 +2005,29 @@ esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
     ext_port_hdl_t port_hdl = ext_hub_dev->constant.ports[port_num - 1];
     EXT_HUB_CHECK(port_hdl != NULL, ESP_ERR_INVALID_STATE);
 
-    // The hub's control pipe must be idle: none of its ports being handled
-    if (ext_hub_dev->single_thread.user_op ||
-            ext_hub_dev->single_thread.stage != EXT_HUB_STAGE_IDLE ||
-            ext_port_has_pending(ext_hub_dev)) {
+    // Only the port itself being handled makes the request wait: requests for
+    // other ports are queued behind the ports being handled (ports are handled
+    // in order, one control request at a time per hub).
+    if (ext_port_is_pending(port_hdl)) {
+        return ESP_ERR_NOT_FINISHED;
+    }
+    const bool hub_idle = !ext_port_has_pending(ext_hub_dev);
+    if (hub_idle && ext_hub_dev->single_thread.stage != EXT_HUB_STAGE_IDLE) {
+        // Hub-level control request in flight
         return ESP_ERR_NOT_FINISHED;
     }
 
-    ext_hub_dev->single_thread.user_op = true;
+    // While the hub is idle its interrupt endpoint is armed: status changes
+    // arriving while this request is handled are deferred until it completes.
+    // If ports are already being handled the endpoint is re-armed only after
+    // all of them, including this one, are done.
+    const bool prev_user_op = ext_hub_dev->single_thread.user_op;
+    if (ext_hub_dev->single_thread.in_ep_armed) {
+        ext_hub_dev->single_thread.user_op = true;
+    }
     ret = p_ext_hub_driver->constant.port_driver->power(port_hdl, enable);
     if (ret != ESP_OK) {
-        ext_hub_dev->single_thread.user_op = false;
+        ext_hub_dev->single_thread.user_op = prev_user_op;
     }
     return ret;
 }

@@ -11,6 +11,17 @@ menu "USB-OTG"
             - The maximum length of control transfers is limited
             - Device's with configuration descriptors larger than this limit cannot be supported
 
+    config USB_HOST_ENUM_CTRL_TIMEOUT_MS
+        int "Enumeration control transfer timeout (ms, 0 = none)"
+        default 2000
+        range 0 60000
+        help
+            If a control transfer sent while enumerating a device does not complete within this time (e.g.
+            the device NAKs forever), the device's port is disabled so the enumeration is canceled. Ports are
+            enumerated one at a time, so without a timeout one unresponsive device stops every other device
+            from enumerating. The default can be changed at run time with usb_host_set_enum_timeout(), and per
+            device with usb_host_set_enum_timeout_cb().
+
     choice USB_HOST_HW_BUFFER_BIAS
         prompt "Hardware FIFO size biasing"
         default USB_HOST_HW_BUFFER_BIAS_BALANCED

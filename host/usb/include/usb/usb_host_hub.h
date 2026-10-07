@@ -71,6 +71,22 @@ typedef struct {
 } usb_host_hub_port_path_t;
 
 /**
+ * @brief Enumeration timeout callback return value: use the default timeout
+ */
+#define USB_HOST_ENUM_TIMEOUT_DEFAULT   UINT32_MAX
+
+/**
+ * @brief Enumeration timeout callback
+ *
+ * Called from the USB Host Library task when the enumeration of a device starts,
+ * with the location of the device (depth 0 for a device on the root port).
+ * Return the control transfer timeout in ms for this device, 0 for no timeout,
+ * or USB_HOST_ENUM_TIMEOUT_DEFAULT. Must not block or call USB Host Library
+ * functions.
+ */
+typedef uint32_t (*usb_host_enum_timeout_cb_t)(const usb_host_hub_port_path_t *path, void *arg);
+
+/**
  * @brief Port power policy callback
  *
  * Called from the USB Host Library task when an external hub's port is created
@@ -154,6 +170,29 @@ esp_err_t usb_host_hub_get_snapshot(uint8_t dev_addr, usb_host_hub_info_t *info,
                                     usb_host_hub_port_info_t *ports, size_t max_ports, size_t *num_ports);
 
 /**
+ * @brief Set the default enumeration control transfer timeout
+ *
+ * A device whose enumeration control transfer does not complete within this time has
+ * its port disabled, so it does not stop other devices from enumerating. Defaults to
+ * CONFIG_USB_HOST_ENUM_CTRL_TIMEOUT_MS. Can be called before usb_host_install().
+ *
+ * @param[in] timeout_ms    Timeout in ms, 0 for no timeout
+ */
+void usb_host_set_enum_timeout(uint32_t timeout_ms);
+
+/**
+ * @brief Get the default enumeration control transfer timeout (ms, 0 = none)
+ */
+uint32_t usb_host_get_enum_timeout(void);
+
+/**
+ * @brief Set the per-device enumeration timeout callback (NULL to remove)
+ *
+ * Can be called before usb_host_install().
+ */
+void usb_host_set_enum_timeout_cb(usb_host_enum_timeout_cb_t cb, void *arg);
+
+/**
  * @brief Set the port power policy callback (NULL to remove)
  *
  * Can be called before usb_host_install(). Ports of hubs already enumerated are
@@ -184,8 +223,13 @@ void usb_host_hub_set_port_policy(usb_host_hub_port_policy_cb_t cb, void *arg);
  *    - ESP_ERR_NOT_SUPPORTED:  The hub does not support per-port power switching (and no FORCE flag)
  *    - ESP_ERR_INVALID_SIZE:   Port number out of range
  *    - ESP_ERR_INVALID_STATE:  The hub is not configured, or the port is being reset
- *    - ESP_ERR_TIMEOUT:        The hub stayed busy handling other ports
+ *    - ESP_ERR_NOT_FINISHED:   The port is being handled right now (e.g. its device is
+ *                              enumerating); retry shortly. Requests for other ports and
+ *                              hubs are not affected and the call does not wait.
  *    - see usb_host_hub_get_info() for other errors
+ *
+ * @note The request is queued behind ports of the same hub that are being handled
+ *       (one control request at a time per hub); ESP_OK means it was accepted.
  */
 esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enable, uint32_t flags);
 

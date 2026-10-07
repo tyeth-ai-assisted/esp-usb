@@ -1519,3 +1519,9 @@ void ext_port_debug_dump(void)
     }
     ESP_LOGW(EXT_PORT_TAG, "%d port(s) pending", n);
 }
+
+bool ext_port_is_pending(ext_port_hdl_t port_hdl)
+{
+    EXT_PORT_CHECK(p_ext_port_driver != NULL && port_hdl != NULL, false);
+    return ((ext_port_t *)port_hdl)->flags.in_pending_list;
+}

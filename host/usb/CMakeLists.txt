@@ -10,7 +10,7 @@ set(priv_includes)
 # As CONFIG_SOC_USB_OTG_SUPPORTED comes from Kconfig, it is not evaluated yet
 # when components are being registered.
 # Thus, always add the (private) requirements, regardless of Kconfig
-set(priv_requires esp_mm)
+set(priv_requires esp_mm esp_timer)
 
 # Explicitly add psram component for esp32p4, as the USB-DWC internal DMA can access PSRAM on esp32p4
 if(${target} STREQUAL "esp32p4")

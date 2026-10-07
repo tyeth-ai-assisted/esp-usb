@@ -462,6 +462,12 @@ static void enum_event_callback(enum_event_data_t *event_data, void *arg)
     case ENUM_EVENT_CANCELED:
         hub_node_disable(event_data->node_uid);
         break;
+    case ENUM_EVENT_TIMEOUT:
+        // Disabling the port makes the stuck transfer fail, which cancels the enumeration
+        if (hub_node_disable(event_data->node_uid) != ESP_OK) {
+            ESP_LOGE(USB_HOST_TAG, "Unable to disable the port of uid %u", event_data->node_uid);
+        }
+        break;
     default:
         abort();    // Should never occur
         break;
