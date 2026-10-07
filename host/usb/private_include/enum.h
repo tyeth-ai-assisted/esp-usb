@@ -41,7 +41,6 @@ typedef enum {
     ENUM_EVENT_RESET_REQUIRED,      /**< Enumerating device requires a reset */
     ENUM_EVENT_COMPLETED,           /**< Enumeration of a device has completed */
     ENUM_EVENT_CANCELED,            /**< Enumeration of a device was canceled */
-    ENUM_EVENT_TIMEOUT,             /**< A control transfer to the device did not complete: its port must be disabled */
 } enum_event_t;
 
 typedef struct {

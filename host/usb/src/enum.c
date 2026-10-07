@@ -791,7 +791,50 @@ static volatile uint32_t s_default_timeout_ms = CONFIG_USB_HOST_ENUM_CTRL_TIMEOU
 static uint32_t s_timeout_ms;                       // Timeout of the device being enumerated
 static usb_host_enum_timeout_cb_t s_timeout_cb;
 static void *s_timeout_cb_arg;
+static usb_host_enum_event_cb_t s_event_cb;
+static void *s_event_cb_arg;
 static portMUX_TYPE s_timeout_lock = portMUX_INITIALIZER_UNLOCKED;
+
+// Diagnostics of the enumeration in progress
+static usb_host_hub_port_path_t s_cur_path;
+static int64_t s_cur_start_us;
+static usb_host_enum_fail_t s_fail_reason;
+static enum_stage_t s_fail_stage;
+static int s_fail_status;
+
+void usb_host_set_enum_event_cb(usb_host_enum_event_cb_t cb, void *arg)
+{
+    portENTER_CRITICAL(&s_timeout_lock);
+    s_event_cb = cb;
+    s_event_cb_arg = arg;
+    portEXIT_CRITICAL(&s_timeout_lock);
+}
+
+static void emit_enum_event(usb_host_enum_event_t *event)
+{
+    portENTER_CRITICAL(&s_timeout_lock);
+    usb_host_enum_event_cb_t cb = s_event_cb;
+    void *arg = s_event_cb_arg;
+    portEXIT_CRITICAL(&s_timeout_lock);
+    if (cb == NULL) {
+        return;
+    }
+    event->path = s_cur_path;
+    event->uid = p_enum_driver->single_thread.node_uid;
+    event->elapsed_ms = (uint32_t)((esp_timer_get_time() - s_cur_start_us) / 1000);
+    event->timeout_ms = s_timeout_ms;
+    cb(event, arg);
+}
+
+/* Record why the enumeration failed (the first reason wins) */
+static void note_failure(usb_host_enum_fail_t reason, enum_stage_t stage, int transfer_status)
+{
+    if (s_fail_reason == USB_HOST_ENUM_FAIL_NONE) {
+        s_fail_reason = reason;
+        s_fail_stage = stage;
+        s_fail_status = transfer_status;
+    }
+}
 
 void usb_host_set_enum_timeout(uint32_t timeout_ms)
 {
@@ -811,18 +854,9 @@ void usb_host_set_enum_timeout_cb(usb_host_enum_timeout_cb_t cb, void *arg)
     portEXIT_CRITICAL(&s_timeout_lock);
 }
 
-/* Timeout for the device about to be enumerated: per-device callback, else default */
-static uint32_t resolve_timeout_ms(usb_device_handle_t dev_hdl)
+/* Location of a device: port numbers from the root hub down to the device */
+static void device_path(usb_device_handle_t dev_hdl, usb_host_hub_port_path_t *out)
 {
-    portENTER_CRITICAL(&s_timeout_lock);
-    usb_host_enum_timeout_cb_t cb = s_timeout_cb;
-    void *arg = s_timeout_cb_arg;
-    portEXIT_CRITICAL(&s_timeout_lock);
-    if (cb == NULL) {
-        return s_default_timeout_ms;
-    }
-
-    // Port numbers from the device up to the hub on the root port
     usb_host_hub_port_path_t path = {0};
     uint8_t up[sizeof(path.ports)];
     size_t n = 0;
@@ -843,7 +877,20 @@ static uint32_t resolve_timeout_ms(usb_device_handle_t dev_hdl)
     while (n > 0) {
         path.ports[path.depth++] = up[--n];
     }
-    uint32_t ms = cb(&path, arg);
+    *out = path;
+}
+
+/* Timeout for the device about to be enumerated: per-device callback, else default */
+static uint32_t resolve_timeout_ms(const usb_host_hub_port_path_t *path)
+{
+    portENTER_CRITICAL(&s_timeout_lock);
+    usb_host_enum_timeout_cb_t cb = s_timeout_cb;
+    void *arg = s_timeout_cb_arg;
+    portEXIT_CRITICAL(&s_timeout_lock);
+    if (cb == NULL) {
+        return s_default_timeout_ms;
+    }
+    uint32_t ms = cb(path, arg);
     return (ms == USB_HOST_ENUM_TIMEOUT_DEFAULT) ? s_default_timeout_ms : ms;
 }
 
@@ -997,6 +1044,14 @@ static esp_err_t stage_cancel(void)
     const unsigned int node_uid = p_enum_driver->single_thread.node_uid;
     usb_device_handle_t dev_hdl = p_enum_driver->single_thread.dev_hdl;
 
+    usb_host_enum_event_t ev = {
+        .kind = USB_HOST_ENUM_EVENT_FAILED,
+        .fail_reason = s_fail_reason != USB_HOST_ENUM_FAIL_NONE ? s_fail_reason : USB_HOST_ENUM_FAIL_TRANSFER,
+        .stage = enum_stage_strings[s_fail_stage],
+        .transfer_status = s_fail_status,
+    };
+    emit_enum_event(&ev);
+
     if (dev_hdl) {
         ESP_ERROR_CHECK(usbh_dev_enum_unlock(dev_hdl));
         ESP_ERROR_CHECK(usbh_dev_close(dev_hdl));
@@ -1028,6 +1083,18 @@ static esp_err_t stage_complete(void)
     usb_device_handle_t dev_hdl = p_enum_driver->single_thread.dev_hdl;
     uint8_t dev_addr = 0;
     ESP_ERROR_CHECK(usbh_dev_get_addr(dev_hdl, &dev_addr));
+
+    usb_host_enum_event_t ev = {
+        .kind = USB_HOST_ENUM_EVENT_COMPLETED,
+        .dev_addr = dev_addr,
+        .transfer_status = -1,
+    };
+    const usb_device_desc_t *dev_desc = NULL;
+    if (usbh_dev_get_desc(dev_hdl, &dev_desc) == ESP_OK && dev_desc != NULL) {
+        ev.vid = dev_desc->idVendor;
+        ev.pid = dev_desc->idProduct;
+    }
+    emit_enum_event(&ev);
 
     // Close device
     ESP_ERROR_CHECK(usbh_dev_enum_unlock(dev_hdl));
@@ -1360,7 +1427,12 @@ esp_err_t enum_start(unsigned int uid)
     // Get device info
     usb_device_info_t dev_info;
     ESP_ERROR_CHECK(usbh_dev_get_info(dev_hdl, &dev_info));
-    s_timeout_ms = resolve_timeout_ms(dev_hdl);
+    device_path(dev_hdl, &s_cur_path);
+    s_timeout_ms = resolve_timeout_ms(&s_cur_path);
+    s_cur_start_us = esp_timer_get_time();
+    s_fail_reason = USB_HOST_ENUM_FAIL_NONE;
+    s_fail_stage = ENUM_STAGE_IDLE;
+    s_fail_status = -1;
 
     // Stage ENUM_STAGE_GET_SHORT_DEV_DESC
     ESP_LOGD(ENUM_TAG, "Start processing device with uid %d", uid);
@@ -1375,6 +1447,12 @@ esp_err_t enum_start(unsigned int uid)
     p_enum_driver->single_thread.dev_params.bMaxPacketSize0 = (dev_info.speed == USB_SPEED_LOW)
                                                               ? ENUM_WORST_CASE_MPS_LS
                                                               : ENUM_WORST_CASE_MPS_FS_HS;
+
+    usb_host_enum_event_t ev_started = {
+        .kind = USB_HOST_ENUM_EVENT_STARTED,
+        .transfer_status = -1,
+    };
+    emit_enum_event(&ev_started);
 
     // Notify USB Host about starting enumeration process
     enum_event_data_t event_data = {
@@ -1424,6 +1502,7 @@ esp_err_t enum_cancel(unsigned int uid)
         return ESP_OK;
     }
 
+    note_failure(USB_HOST_ENUM_FAIL_DISCONNECTED, old_stage, -1);
     p_enum_driver->single_thread.stage = ENUM_STAGE_CANCEL;
 
     ESP_LOGV(ENUM_TAG, "Cancel at %s", enum_stage_strings[old_stage]);
@@ -1460,16 +1539,14 @@ esp_err_t enum_process(void)
     if (s_ctrl_timed_out) {
         s_ctrl_timed_out = false;
         if (stage_is_ctrl_check(stage)) {
-            // The control transfer is still in flight: disable the device's port so
-            // the transfer fails, the enumeration gets canceled and the next port
-            // can enumerate. Nothing else to process until the transfer completes.
-            ESP_LOGE(ENUM_TAG, "Device uid %u did not answer within %"PRIu32" ms at stage %s, disabling its port",
+            // The control transfer is still in flight: abort it. It completes as
+            // canceled, which fails this enumeration attempt (the port is retried
+            // later) and lets the next port enumerate. Nothing else to process
+            // until the transfer completes.
+            ESP_LOGE(ENUM_TAG, "Device uid %u did not answer within %"PRIu32" ms at stage %s, aborting the transfer",
                      p_enum_driver->single_thread.node_uid, s_timeout_ms, enum_stage_strings[stage]);
-            enum_event_data_t event_data = {
-                .event = ENUM_EVENT_TIMEOUT,
-                .node_uid = p_enum_driver->single_thread.node_uid,
-            };
-            p_enum_driver->constant.enum_event_cb(&event_data, p_enum_driver->constant.enum_event_cb_arg);
+            note_failure(USB_HOST_ENUM_FAIL_TIMEOUT, stage, -1);
+            usbh_dev_abort_ctrl(p_enum_driver->single_thread.dev_hdl);
             return ESP_OK;
         }
         // The transfer completed just as the timer fired: process normally
@@ -1515,6 +1592,11 @@ esp_err_t enum_process(void)
     case ENUM_STAGE_CHECK_SHORT_SER_STR_DESC:
     case ENUM_STAGE_CHECK_FULL_SER_STR_DESC:
         res = control_response_handling(stage);
+        if (res != ESP_OK && !(stage >= ENUM_STAGE_CHECK_SHORT_LANGID_TABLE &&
+                               stage <= ENUM_STAGE_CHECK_FULL_SER_STR_DESC)) {
+            note_failure(USB_HOST_ENUM_FAIL_TRANSFER, stage,
+                         (int)p_enum_driver->constant.urb->transfer.status);
+        }
         break;
     case ENUM_STAGE_SELECT_CONFIG:
         res = select_active_configuration();

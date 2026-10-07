@@ -87,6 +87,50 @@ typedef struct {
 typedef uint32_t (*usb_host_enum_timeout_cb_t)(const usb_host_hub_port_path_t *path, void *arg);
 
 /**
+ * @brief Enumeration event kind
+ */
+typedef enum {
+    USB_HOST_ENUM_EVENT_STARTED = 0,    /**< Enumeration of a device started */
+    USB_HOST_ENUM_EVENT_COMPLETED,      /**< The device is enumerated */
+    USB_HOST_ENUM_EVENT_FAILED,         /**< Enumeration failed, see fail_reason */
+} usb_host_enum_event_kind_t;
+
+/**
+ * @brief Why an enumeration failed
+ */
+typedef enum {
+    USB_HOST_ENUM_FAIL_NONE = 0,
+    USB_HOST_ENUM_FAIL_TIMEOUT,         /**< A control transfer got no answer within the timeout (device present but NAKing: slow or stalled); its port was disabled */
+    USB_HOST_ENUM_FAIL_TRANSFER,        /**< A control transfer failed (see transfer_status): e.g. the device reset or dropped off the bus mid-transfer, or returned bad data */
+    USB_HOST_ENUM_FAIL_DISCONNECTED,    /**< The device disconnected (or its port was disabled) during enumeration: typically a device rebooting */
+} usb_host_enum_fail_t;
+
+/**
+ * @brief Enumeration event, see usb_host_set_enum_event_cb()
+ */
+typedef struct {
+    usb_host_enum_event_kind_t kind;
+    usb_host_hub_port_path_t path;      /**< Location of the device (depth 0 = root port) */
+    unsigned int uid;                   /**< Device tree node uid */
+    uint32_t elapsed_ms;                /**< Time since the enumeration started */
+    uint32_t timeout_ms;                /**< Control transfer timeout used for this device (0 = none) */
+    usb_host_enum_fail_t fail_reason;   /**< FAILED: why */
+    const char *stage;                  /**< FAILED: stage that failed (static string) */
+    int transfer_status;                /**< FAILED with USB_HOST_ENUM_FAIL_TRANSFER: usb_transfer_status_t, else -1 */
+    uint8_t dev_addr;                   /**< COMPLETED: assigned device address */
+    uint16_t vid;                       /**< COMPLETED: idVendor */
+    uint16_t pid;                       /**< COMPLETED: idProduct */
+} usb_host_enum_event_t;
+
+/**
+ * @brief Enumeration event callback
+ *
+ * Called from the USB Host Library task. Must not block or call USB Host Library
+ * functions; copy what is needed.
+ */
+typedef void (*usb_host_enum_event_cb_t)(const usb_host_enum_event_t *event, void *arg);
+
+/**
  * @brief Port power policy callback
  *
  * Called from the USB Host Library task when an external hub's port is created
@@ -184,6 +228,16 @@ void usb_host_set_enum_timeout(uint32_t timeout_ms);
  * @brief Get the default enumeration control transfer timeout (ms, 0 = none)
  */
 uint32_t usb_host_get_enum_timeout(void);
+
+/**
+ * @brief Set the enumeration event callback (NULL to remove)
+ *
+ * Reports every enumeration start, completion and failure with its reason, so an
+ * application can tell a device that was rebooting (disconnect, transfer error,
+ * followed by a new enumeration of the same port) from one that is slow or stalled
+ * (timeout while still connected). Can be called before usb_host_install().
+ */
+void usb_host_set_enum_event_cb(usb_host_enum_event_cb_t cb, void *arg);
 
 /**
  * @brief Set the per-device enumeration timeout callback (NULL to remove)

@@ -11,6 +11,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_timer.h"
 #include "usb_private.h"
 #include "usb/usb_types_ch9.h"
 #include "usb/usb_types_ch11.h"
@@ -28,6 +29,12 @@
 #define EXT_PORT_RESET_RECOVERY_DELAY_MS       CONFIG_USB_HOST_EXT_PORT_RESET_RECOVERY_DELAY_MS
 #define EXT_PORT_POWER_ON_CUSTOM_DELAY         CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_ENABLE
 #define EXT_PORT_POWER_ON_CUSTOM_DELAY_MS      CONFIG_USB_HOST_EXT_PORT_CUSTOM_POWER_ON_DELAY_MS
+
+// A port whose device failed to enumerate (timeout, transfer error) is disabled,
+// then reset and enumerated again after a back-off, as long as the device stays
+// connected: a slow or stuck device is never given up on for good.
+#define EXT_PORT_RETRY_FIRST_MS     1000
+#define EXT_PORT_RETRY_MAX_MS       30000
 
 /**
  * @brief External Port driver action flags
@@ -84,6 +91,10 @@ struct ext_port_s {
     port_dev_state_t dev_state;             /**< Ports' device state */
     uint8_t dev_reset_attempts;             /**< Ports' device reset failure */
     port_power_req_t power_req;             /**< Pending user power request */
+    uint8_t enum_retries;                   /**< Re-enumeration attempts since the device last enumerated */
+    int64_t retry_due_us;                   /**< When to retry, while in retry_tailq */
+    TAILQ_ENTRY(ext_port_s) retry_entry;    /**< Entry in retry_tailq */
+    bool in_retry_list;
 
     struct {
         // Port related constant members
@@ -104,6 +115,7 @@ typedef struct ext_port_s ext_port_t;
 typedef struct {
     struct {
         TAILQ_HEAD(ext_ports, ext_port_s)       pending_tailq;           /**< External Ports require handling */
+        TAILQ_HEAD(ext_ports_retry, ext_port_s) retry_tailq;             /**< Ports waiting to retry enumeration */
     } single_thread;                            /**< Single thread members don't require a critical section so long as they are never accessed from multiple threads */
 
     struct {
@@ -117,6 +129,8 @@ typedef struct {
 } ext_port_driver_t;
 
 static ext_port_driver_t *p_ext_port_driver = NULL;
+static esp_timer_handle_t s_retry_timer;
+static volatile bool s_retry_due;
 
 const char *EXT_PORT_TAG = "EXT_PORT";
 
@@ -556,6 +570,9 @@ static void handle_port_connection(ext_port_t *ext_port)
             } else {
                 // New device connected, flush reset attempts
                 ext_port->dev_reset_attempts = 0;
+                if (!ext_port->in_retry_list) {
+                    ext_port->enum_retries = 0;
+                }
                 ext_port->state = USB_PORT_STATE_RESETTING;
                 // New device has not been enumerated yet, reset the flag
                 ext_port->flags.has_enum_device = 0;
@@ -855,6 +872,95 @@ static void handle_recycle(ext_port_t *ext_port)
  *
  * @param[in] ext_port  Port object
  */
+static void retry_timer_cb(void *arg)
+{
+    (void)arg;
+    s_retry_due = true;
+    if (p_ext_port_driver != NULL) {
+        p_ext_port_driver->constant.proc_req_cb(p_ext_port_driver->constant.proc_req_cb_arg);
+    }
+}
+
+static void retry_arm_timer(void)
+{
+    if (s_retry_timer == NULL) {
+        return;
+    }
+    int64_t earliest = INT64_MAX;
+    ext_port_t *port;
+    TAILQ_FOREACH(port, &p_ext_port_driver->single_thread.retry_tailq, retry_entry) {
+        if (port->retry_due_us < earliest) {
+            earliest = port->retry_due_us;
+        }
+    }
+    esp_timer_stop(s_retry_timer);
+    if (earliest != INT64_MAX) {
+        int64_t wait = earliest - esp_timer_get_time();
+        esp_timer_start_once(s_retry_timer, wait > 1000 ? (uint64_t)wait : 1000);
+    }
+}
+
+static void retry_cancel(ext_port_t *ext_port)
+{
+    if (ext_port->in_retry_list) {
+        TAILQ_REMOVE(&p_ext_port_driver->single_thread.retry_tailq, ext_port, retry_entry);
+        ext_port->in_retry_list = false;
+    }
+}
+
+/* Schedule a reset + re-enumeration of a port whose device failed to enumerate */
+static void retry_schedule(ext_port_t *ext_port)
+{
+    uint32_t delay_ms = EXT_PORT_RETRY_FIRST_MS;
+    for (uint8_t i = 0; i < ext_port->enum_retries && delay_ms < EXT_PORT_RETRY_MAX_MS; i++) {
+        delay_ms *= 2;
+    }
+    if (delay_ms > EXT_PORT_RETRY_MAX_MS) {
+        delay_ms = EXT_PORT_RETRY_MAX_MS;
+    }
+    if (ext_port->enum_retries < UINT8_MAX) {
+        ext_port->enum_retries++;
+    }
+    ext_port->retry_due_us = esp_timer_get_time() + (int64_t)delay_ms * 1000;
+    if (!ext_port->in_retry_list) {
+        TAILQ_INSERT_TAIL(&p_ext_port_driver->single_thread.retry_tailq, ext_port, retry_entry);
+        ext_port->in_retry_list = true;
+    }
+    ESP_LOGW(EXT_PORT_TAG, "Port%d: device failed to enumerate, retry %u in %"PRIu32" ms",
+             ext_port->constant.port_num, ext_port->enum_retries, delay_ms);
+    retry_arm_timer();
+}
+
+/* Run the retries that are due (USB Host Library task) */
+static void retry_process(void)
+{
+    const int64_t now = esp_timer_get_time();
+    ext_port_t *port = TAILQ_FIRST(&p_ext_port_driver->single_thread.retry_tailq);
+    while (port != NULL) {
+        ext_port_t *next = TAILQ_NEXT(port, retry_entry);
+        if (port->retry_due_us <= now) {
+            if (port->flags.in_pending_list) {
+                // Still being handled (e.g. waiting for the device to be freed): later
+                port->retry_due_us = now + 250 * 1000;
+            } else {
+                retry_cancel(port);
+                if (!port->flags.is_gone && !port->flags.user_power_off &&
+                        port->state == USB_PORT_STATE_DISABLED) {
+                    ESP_LOGI(EXT_PORT_TAG, "Port%d: retrying enumeration (attempt %u)",
+                             port->constant.port_num, port->enum_retries);
+                    // Re-read the port: if the device is still connected it is reset
+                    // and enumerated again from USB_PORT_STATE_DISCONNECTED
+                    port->state = USB_PORT_STATE_DISCONNECTED;
+                    port->dev_reset_attempts = 0;
+                    port_set_actions(port, PORT_ACTION_GET_STATUS);
+                }
+            }
+        }
+        port = next;
+    }
+    retry_arm_timer();
+}
+
 static void handle_disable(ext_port_t *ext_port)
 {
     ESP_LOGD(EXT_PORT_TAG, "Port%d disable (state=%d, dev=%d)",
@@ -872,8 +978,9 @@ static void handle_disable(ext_port_t *ext_port)
                      ext_port->constant.port_num,
                      ext_port->dev_reset_attempts);
 
-            // Do not try to reset port anymore
+            // No immediate reset; the port is retried after a back-off
             ext_port->dev_reset_attempts = EXT_PORT_RESET_ATTEMPTS;
+            retry_schedule(ext_port);
 
             if (ext_port->dev_state == PORT_DEV_PRESENT) {
                 ext_port->dev_state = PORT_DEV_NOT_PRESENT;
@@ -912,6 +1019,8 @@ static void handle_power(ext_port_t *ext_port)
              ext_port->state,
              ext_port->dev_state);
 
+    retry_cancel(ext_port);
+    ext_port->enum_retries = 0;
     if (req == PORT_POWER_REQ_OFF) {
         ext_port->flags.user_power_off = 1;
         if (ext_port->state != USB_PORT_STATE_POWERED_OFF) {
@@ -1106,6 +1215,8 @@ static esp_err_t port_active(void *port_hdl)
     ESP_LOGD(EXT_PORT_TAG, "Port%d has an enumerated device", ext_port->constant.port_num);
 
     ext_port->flags.has_enum_device = 1;
+    ext_port->enum_retries = 0;
+    retry_cancel(ext_port);
 
     if (!ext_port->flags.in_pending_list || ext_port->flags.waiting_recycle ||
             ext_port->action_flags != 0) {
@@ -1160,6 +1271,7 @@ static esp_err_t port_delete(void *port_hdl)
     // Sanity checks
     assert(ext_port->dev_state == PORT_DEV_NOT_PRESENT);    // Port should not have a device
     assert(ext_port->flags.in_pending_list == 0);           // Port should not be in pending list
+    retry_cancel(ext_port);
 
     ESP_LOGD(EXT_PORT_TAG, "Port%d freeing", ext_port->constant.port_num);
 
@@ -1195,6 +1307,7 @@ static esp_err_t port_gone(void *port_hdl)
 
     ext_port->flags.is_gone = 1;
     ext_port->flags.waiting_free = 1;
+    retry_cancel(ext_port);
 
     switch (ext_port->state) {
     case USB_PORT_STATE_ENABLED:
@@ -1375,6 +1488,16 @@ esp_err_t ext_port_install(const ext_port_driver_config_t *config)
     ext_port_drv->constant.hub_request_cb = config->hub_request_cb;
     ext_port_drv->constant.hub_request_cb_arg = config->hub_request_cb_arg;
     TAILQ_INIT(&ext_port_drv->single_thread.pending_tailq);
+    TAILQ_INIT(&ext_port_drv->single_thread.retry_tailq);
+    if (s_retry_timer == NULL) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = retry_timer_cb,
+            .name = "usb_port_retry",
+        };
+        if (esp_timer_create(&timer_args, &s_retry_timer) != ESP_OK) {
+            s_retry_timer = NULL;
+        }
+    }
 
     p_ext_port_driver = ext_port_drv;
 
@@ -1388,6 +1511,9 @@ esp_err_t ext_port_uninstall(void)
     EXT_PORT_CHECK(TAILQ_EMPTY(&p_ext_port_driver->single_thread.pending_tailq), ESP_ERR_INVALID_STATE);
     ext_port_driver_t *ext_port_drv = p_ext_port_driver;
     p_ext_port_driver = NULL;
+    if (s_retry_timer != NULL) {
+        esp_timer_stop(s_retry_timer);
+    }
 
     heap_caps_free(ext_port_drv);
     ESP_LOGD(EXT_PORT_TAG, "Driver uninstalled");
@@ -1397,6 +1523,11 @@ esp_err_t ext_port_uninstall(void)
 esp_err_t ext_port_process(void)
 {
     EXT_PORT_CHECK(p_ext_port_driver != NULL, ESP_ERR_NOT_ALLOWED);
+
+    if (s_retry_due) {
+        s_retry_due = false;
+        retry_process();
+    }
 
     ext_port_t *ext_port = get_port_from_pending_list();
     if (ext_port == NULL) {

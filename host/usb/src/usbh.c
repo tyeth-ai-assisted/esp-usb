@@ -1761,3 +1761,21 @@ esp_err_t usbh_ep_dequeue_urb(usbh_ep_handle_t ep_hdl, urb_t **urb_ret)
     *urb_ret = hcd_urb_dequeue(ep_obj->constant.pipe_hdl);
     return ESP_OK;
 }
+
+esp_err_t usbh_dev_abort_ctrl(usb_device_handle_t dev_hdl)
+{
+    USBH_CHECK(dev_hdl != NULL, ESP_ERR_INVALID_ARG);
+    device_t *dev_obj = (device_t *)dev_hdl;
+
+    // Same recovery as an EP0 pipe error: retire the in-flight URBs (they complete
+    // as canceled through the usual transfer callback), then reactivate the pipe
+    USBH_ENTER_CRITICAL();
+    bool call_proc_req_cb = _dev_set_actions(dev_obj, DEV_ACTION_EP0_FLUSH |
+                                                      DEV_ACTION_EP0_DEQUEUE |
+                                                      DEV_ACTION_EP0_CLEAR);
+    USBH_EXIT_CRITICAL();
+    if (call_proc_req_cb) {
+        p_usbh_obj->constant.proc_req_cb(USB_PROC_REQ_SOURCE_USBH, false, p_usbh_obj->constant.proc_req_cb_arg);
+    }
+    return ESP_OK;
+}

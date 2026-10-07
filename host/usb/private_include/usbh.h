@@ -718,6 +718,17 @@ void *usbh_ep_get_context(usbh_ep_handle_t ep_hdl);
 esp_err_t usbh_dev_submit_ctrl_urb(usb_device_handle_t dev_hdl, urb_t *urb);
 
 /**
+ * @brief Abort the control transfers in flight on a device's EP0
+ *
+ * The URBs complete with USB_TRANSFER_STATUS_CANCELED through their callback and
+ * EP0 is made active again. The device and its port are left untouched.
+ *
+ * @param[in] dev_hdl Device handle
+ * @return ESP_OK, or ESP_ERR_INVALID_ARG
+ */
+esp_err_t usbh_dev_abort_ctrl(usb_device_handle_t dev_hdl);
+
+/**
  * @brief Enqueue a URB to an endpoint
  *
  * The URB will remain enqueued until it completes (successfully or errors out). Use usbh_ep_dequeue_urb() to dequeue
