@@ -316,7 +316,20 @@ esp_err_t ext_hub_user_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_hos
  *    - ESP_ERR_INVALID_SIZE:   Port number out of range
  *    - ESP_OK:                 Power change started
  */
-esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable);
+esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable, uint32_t flags);
+
+/**
+ * @brief Get a hub's information and all of its port statuses
+ *
+ * @note Must be called from the USB Host processing task
+ */
+esp_err_t ext_hub_user_get_snapshot(uint8_t dev_addr, usb_host_hub_info_t *info,
+                                    usb_host_hub_port_info_t *ports, size_t max_ports, size_t *num_ports);
+
+/**
+ * @brief Set the port power policy callback (thread safe)
+ */
+void ext_hub_set_port_policy(usb_host_hub_port_policy_cb_t cb, void *arg);
 
 /**
  * @brief Log the state of every external hub and pending port (diagnostics)

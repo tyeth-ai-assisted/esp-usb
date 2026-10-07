@@ -109,6 +109,7 @@ typedef struct {
     void *context;                              /**< Ports' parent external Hub handle */
     uint8_t port_num;                    /**< Ports' parent port number */
     uint16_t port_power_delay_ms;               /**< Ports' Power on time to Power Good, ms */
+    bool power_off;                             /**< Keep the port powered off (port power policy) */
 } ext_port_config_t;
 
 // -------------------- External Port Processing Functions ---------------------

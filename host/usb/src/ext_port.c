@@ -648,7 +648,12 @@ static void handle_port_state(ext_port_t *ext_port)
         break;
     case USB_PORT_STATE_POWERED_OFF:
         if (ext_port->flags.user_power_off) {
-            // Port was switched off on user request, keep it unpowered
+            // Port was switched off on user request (or by the port power policy),
+            // keep it unpowered. Hubs may come up with their ports powered.
+            if (port_is_powered(ext_port)) {
+                port_clear_feature(ext_port, USB_FEATURE_PORT_POWER);
+                need_handling = true;
+            }
             break;
         }
         // Port power state depends on the wHubCharacteristics.power_switching
@@ -974,6 +979,7 @@ static esp_err_t port_new(void *port_cfg, void **port_hdl)
 
     ext_port->state = USB_PORT_STATE_NOT_CONFIGURED;
     ext_port->dev_state = PORT_DEV_NOT_PRESENT;
+    ext_port->flags.user_power_off = config->power_off;
 
     ESP_LOGD(EXT_PORT_TAG, "Port%d has been added (PwrOn2PwrGood=%d ms)",
              ext_port->constant.port_num,

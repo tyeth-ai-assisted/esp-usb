@@ -72,6 +72,7 @@ typedef enum {
 #define HUB_USER_REQ_LIST_MAX           16
 
 typedef enum {
+    HUB_USER_REQ_SNAPSHOT,
     HUB_USER_REQ_DEBUG,
     HUB_USER_REQ_LIST,
     HUB_USER_REQ_INFO,
@@ -89,6 +90,7 @@ typedef struct {
     uint8_t dev_addr;
     uint8_t port_num;
     bool enable;
+    uint32_t flags;
     esp_err_t ret;
     union {
         usb_host_hub_info_t hub_info;
@@ -97,6 +99,11 @@ typedef struct {
             uint8_t addrs[HUB_USER_REQ_LIST_MAX];
             size_t count;
         } list;
+        struct {
+            usb_host_hub_info_t info;
+            usb_host_hub_port_info_t ports[USB_HOST_HUB_SNAPSHOT_MAX_PORTS];
+            size_t num_ports;
+        } snapshot;
     } result;
 } hub_user_req_t;
 
@@ -1271,6 +1278,11 @@ static void hub_user_req_process(void)
 
     esp_err_t ret;
     switch (s_user_req.type) {
+    case HUB_USER_REQ_SNAPSHOT:
+        ret = ext_hub_user_get_snapshot(s_user_req.dev_addr, &s_user_req.result.snapshot.info,
+                                        s_user_req.result.snapshot.ports, USB_HOST_HUB_SNAPSHOT_MAX_PORTS,
+                                        &s_user_req.result.snapshot.num_ports);
+        break;
     case HUB_USER_REQ_DEBUG: {
         dev_tree_node_t *node;
         TAILQ_FOREACH(node, &p_hub_driver_obj->single_thread.dev_nodes_tailq, tailq_entry) {
@@ -1292,7 +1304,8 @@ static void hub_user_req_process(void)
         ret = ext_hub_user_get_port_info(s_user_req.dev_addr, s_user_req.port_num, &s_user_req.result.port_info);
         break;
     case HUB_USER_REQ_PORT_POWER:
-        ret = ext_hub_user_port_power(s_user_req.dev_addr, s_user_req.port_num, s_user_req.enable);
+        ret = ext_hub_user_port_power(s_user_req.dev_addr, s_user_req.port_num, s_user_req.enable,
+                                      s_user_req.flags);
         break;
     default:
         ret = ESP_ERR_NOT_SUPPORTED;
@@ -1314,7 +1327,8 @@ static void hub_user_req_process(void)
 #define HUB_USER_REQ_BUSY_RETRY_MS      20
 #define HUB_USER_REQ_BUSY_TIMEOUT_MS    3000
 
-static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, uint8_t port_num, bool enable, void *out)
+static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, uint8_t port_num, bool enable,
+                                  uint32_t flags, void *out)
 {
     HUB_DRIVER_ENTER_CRITICAL();
     HUB_DRIVER_CHECK_FROM_CRIT(p_hub_driver_obj != NULL, ESP_ERR_INVALID_STATE);
@@ -1338,6 +1352,7 @@ static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, ui
         s_user_req.dev_addr = dev_addr;
         s_user_req.port_num = port_num;
         s_user_req.enable = enable;
+        s_user_req.flags = flags;
         s_user_req.pending = true;
         p_hub_driver_obj->dynamic.flags.actions |= HUB_DRIVER_ACTION_USER_REQ;
         HUB_DRIVER_EXIT_CRITICAL();
@@ -1366,7 +1381,9 @@ static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, ui
         ret = ESP_ERR_TIMEOUT;
     }
     if (ret == ESP_OK && out != NULL) {
-        if (type == HUB_USER_REQ_LIST) {
+        if (type == HUB_USER_REQ_SNAPSHOT) {
+            memcpy(out, &s_user_req.result.snapshot, sizeof(s_user_req.result.snapshot));
+        } else if (type == HUB_USER_REQ_LIST) {
             memcpy(out, &s_user_req.result.list, sizeof(s_user_req.result.list));
         } else if (type == HUB_USER_REQ_INFO) {
             *(usb_host_hub_info_t *)out = s_user_req.result.hub_info;
@@ -1433,7 +1450,7 @@ esp_err_t usb_host_hub_list(uint8_t *addrs, size_t max, size_t *count)
         uint8_t addrs[HUB_USER_REQ_LIST_MAX];
         size_t count;
     } list;
-    esp_err_t ret = hub_user_request(HUB_USER_REQ_LIST, 0, 0, false, &list);
+    esp_err_t ret = hub_user_request(HUB_USER_REQ_LIST, 0, 0, false, 0, &list);
     if (ret == ESP_OK) {
         size_t n = list.count < max ? list.count : max;
         if (n > HUB_USER_REQ_LIST_MAX) {
@@ -1452,7 +1469,7 @@ esp_err_t usb_host_hub_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
 {
 #if ENABLE_USB_HUBS
     HUB_DRIVER_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
-    return hub_user_request(HUB_USER_REQ_INFO, dev_addr, 0, false, info);
+    return hub_user_request(HUB_USER_REQ_INFO, dev_addr, 0, false, 0, info);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif // ENABLE_USB_HUBS
@@ -1462,16 +1479,51 @@ esp_err_t usb_host_hub_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_hos
 {
 #if ENABLE_USB_HUBS
     HUB_DRIVER_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
-    return hub_user_request(HUB_USER_REQ_PORT_INFO, dev_addr, port_num, false, info);
+    return hub_user_request(HUB_USER_REQ_PORT_INFO, dev_addr, port_num, false, 0, info);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif // ENABLE_USB_HUBS
 }
 
-esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enable)
+esp_err_t usb_host_hub_get_snapshot(uint8_t dev_addr, usb_host_hub_info_t *info,
+                                    usb_host_hub_port_info_t *ports, size_t max_ports, size_t *num_ports)
 {
 #if ENABLE_USB_HUBS
-    return hub_user_request(HUB_USER_REQ_PORT_POWER, dev_addr, port_num, enable, NULL);
+    HUB_DRIVER_CHECK(info != NULL && num_ports != NULL && (ports != NULL || max_ports == 0), ESP_ERR_INVALID_ARG);
+    // Large result: keep it off the caller's stack
+    struct {
+        usb_host_hub_info_t info;
+        usb_host_hub_port_info_t ports[USB_HOST_HUB_SNAPSHOT_MAX_PORTS];
+        size_t num_ports;
+    } *snap = malloc(sizeof(*snap));
+    if (snap == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t ret = hub_user_request(HUB_USER_REQ_SNAPSHOT, dev_addr, 0, false, 0, snap);
+    if (ret == ESP_OK) {
+        *info = snap->info;
+        size_t n = snap->num_ports < max_ports ? snap->num_ports : max_ports;
+        memcpy(ports, snap->ports, n * sizeof(*ports));
+        *num_ports = n;
+    }
+    free(snap);
+    return ret;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
+}
+
+void usb_host_hub_set_port_policy(usb_host_hub_port_policy_cb_t cb, void *arg)
+{
+#if ENABLE_USB_HUBS
+    ext_hub_set_port_policy(cb, arg);
+#endif // ENABLE_USB_HUBS
+}
+
+esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enable, uint32_t flags)
+{
+#if ENABLE_USB_HUBS
+    return hub_user_request(HUB_USER_REQ_PORT_POWER, dev_addr, port_num, enable, flags, NULL);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif // ENABLE_USB_HUBS
@@ -1480,7 +1532,7 @@ esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
 esp_err_t usb_host_hub_debug_dump(void)
 {
 #if ENABLE_USB_HUBS
-    return hub_user_request(HUB_USER_REQ_DEBUG, 0, 0, false, NULL);
+    return hub_user_request(HUB_USER_REQ_DEBUG, 0, 0, false, 0, NULL);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif // ENABLE_USB_HUBS

@@ -447,13 +447,61 @@ static void device_error(ext_hub_dev_t *ext_hub_dev)
     }
 }
 
+static usb_host_hub_port_policy_cb_t s_port_policy_cb;
+static void *s_port_policy_arg;
+
+void ext_hub_set_port_policy(usb_host_hub_port_policy_cb_t cb, void *arg)
+{
+    EXT_HUB_ENTER_CRITICAL();
+    s_port_policy_cb = cb;
+    s_port_policy_arg = arg;
+    EXT_HUB_EXIT_CRITICAL();
+}
+
+/* Ask the port power policy whether a new port of this hub may be powered */
+static bool port_policy_allows_power(ext_hub_dev_t *ext_hub_dev, uint8_t port_num)
+{
+    EXT_HUB_ENTER_CRITICAL();
+    usb_host_hub_port_policy_cb_t cb = s_port_policy_cb;
+    void *arg = s_port_policy_arg;
+    EXT_HUB_EXIT_CRITICAL();
+    if (cb == NULL) {
+        return true;
+    }
+
+    // Collect the port numbers from this hub up to the hub on the root port
+    uint8_t up[sizeof(((usb_host_hub_port_path_t *)0)->ports)];
+    size_t n = 0;
+    usb_device_handle_t dev_hdl = ext_hub_dev->constant.dev_hdl;
+    usb_device_info_t info;
+    while (dev_hdl != NULL && usbh_dev_get_info(dev_hdl, &info) == ESP_OK &&
+            info.parent.dev_hdl != NULL && n + 1 < sizeof(up)) {
+        up[n++] = info.parent.port_num;
+        dev_hdl = info.parent.dev_hdl;
+    }
+    usb_host_hub_port_path_t path = {
+        .hub_addr = ext_hub_dev->constant.dev_addr,
+        .port_num = port_num,
+    };
+    while (n > 0) {
+        path.ports[path.depth++] = up[--n];
+    }
+    path.ports[path.depth++] = port_num;
+    return cb(&path, arg);
+}
+
 static esp_err_t device_port_new(ext_hub_dev_t *ext_hub_dev, uint8_t port_idx)
 {
     ext_port_config_t port_config = {
         .context = (void *) ext_hub_dev,
         .port_num = port_idx + 1,
         .port_power_delay_ms = ext_hub_dev->constant.hub_desc->bPwrOn2PwrGood * 2,
+        .power_off = !port_policy_allows_power(ext_hub_dev, port_idx + 1),
     };
+    if (port_config.power_off) {
+        ESP_LOGI(EXT_HUB_TAG, "[%d:%d] Kept powered off by the port power policy",
+                 ext_hub_dev->constant.dev_addr, port_idx + 1);
+    }
 
     assert(p_ext_hub_driver->constant.port_driver);
     esp_err_t ret = p_ext_hub_driver->constant.port_driver->new (&port_config, (void **) &ext_hub_dev->constant.ports[port_idx]);
@@ -1904,10 +1952,14 @@ esp_err_t ext_hub_user_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
     }
     info->dev_addr = dev_addr;
     info->num_ports = ext_hub_dev->single_thread.maxchild;
+    info->characteristics = desc->wHubCharacteristics.val;
     info->power_switching = desc->wHubCharacteristics.power_switching;
     info->compound = desc->wHubCharacteristics.compound;
     info->over_current_protection = desc->wHubCharacteristics.ovr_current_protect;
+    info->tt_think_time = desc->wHubCharacteristics.tt_think_time;
+    info->port_indicators = desc->wHubCharacteristics.indicator_support;
     info->pwr_on_to_pwr_good_ms = (uint16_t)desc->bPwrOn2PwrGood * 2;
+    info->hub_contr_current_ma = desc->bHubContrCurrent;
     return ESP_OK;
 }
 
@@ -1935,7 +1987,7 @@ esp_err_t ext_hub_user_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_hos
     return ESP_OK;
 }
 
-esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable)
+esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable, uint32_t flags)
 {
     ext_hub_dev_t *ext_hub_dev = NULL;
     esp_err_t ret = user_get_configured_hub(dev_addr, &ext_hub_dev);
@@ -1943,6 +1995,11 @@ esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
         return ret;
     }
     EXT_HUB_CHECK(port_num != 0 && port_num <= ext_hub_dev->single_thread.maxchild, ESP_ERR_INVALID_SIZE);
+    // Only per-port switched hubs switch a single port (wHubCharacteristics D1..D0 = 01b)
+    if (ext_hub_dev->constant.hub_desc->wHubCharacteristics.power_switching != USB_HOST_HUB_POWER_SWITCHING_PER_PORT &&
+            !(flags & USB_HOST_HUB_PORT_POWER_FLAG_FORCE)) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     EXT_HUB_CHECK(p_ext_hub_driver->constant.port_driver != NULL &&
                   p_ext_hub_driver->constant.port_driver->power != NULL, ESP_ERR_NOT_SUPPORTED);
     ext_port_hdl_t port_hdl = ext_hub_dev->constant.ports[port_num - 1];
@@ -1980,4 +2037,22 @@ void ext_hub_debug_dump(void)
                  hub->dynamic.action_flags);
     }
     ext_port_debug_dump();
+}
+
+esp_err_t ext_hub_user_get_snapshot(uint8_t dev_addr, usb_host_hub_info_t *info,
+                                    usb_host_hub_port_info_t *ports, size_t max_ports, size_t *num_ports)
+{
+    esp_err_t ret = ext_hub_user_get_info(dev_addr, info);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    size_t n = info->num_ports < max_ports ? info->num_ports : max_ports;
+    for (size_t i = 0; i < n; i++) {
+        ret = ext_hub_user_get_port_info(dev_addr, (uint8_t)(i + 1), &ports[i]);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    *num_ports = n;
+    return ESP_OK;
 }
