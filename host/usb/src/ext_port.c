@@ -81,7 +81,8 @@ struct ext_port_s {
             uint32_t waiting_recycle: 1;    /**< Port is waiting to be recycled */
             uint32_t waiting_free: 1;       /**< Port is waiting to be freed */
             uint32_t user_power_off: 1;     /**< Port has been powered off on user request and must stay off */
-            uint32_t reserved24: 24;        /**< Reserved */
+            uint32_t req_in_flight: 1;      /**< A request to the parent Hub (status or feature) has not completed yet */
+            uint32_t reserved23: 23;        /**< Reserved */
         };
         uint32_t val;                       /**< Ports' flags value */
     } flags;                                /**< Ports' flags */
@@ -270,6 +271,7 @@ static esp_err_t port_request_status(ext_port_t *ext_port)
     }
     // Port is requesting status, lock the status
     ext_port->flags.status_lock = 1;
+    ext_port->flags.req_in_flight = 1;
     return ESP_OK;
 }
 
@@ -305,6 +307,7 @@ static esp_err_t port_set_feature(ext_port_t *ext_port, const usb_hub_port_featu
     }
     // Every set feature requires status update
     ext_port->flags.status_outdated = 1;
+    ext_port->flags.req_in_flight = 1;
     switch (feature) {
     case USB_FEATURE_PORT_POWER:
         // PowerOn to PowerGood delay for port
@@ -352,6 +355,7 @@ static esp_err_t port_clear_feature(ext_port_t *ext_port, const usb_hub_port_fea
     }
     // Every clearing feature requires status update
     ext_port->flags.status_outdated = 1;
+    ext_port->flags.req_in_flight = 1;
     return ret;
 }
 
@@ -1403,6 +1407,7 @@ static esp_err_t port_set_status(void *port_hdl, const usb_port_status_t *port_s
     ext_port->flags.status_outdated = 0;
     // Remove status lock
     ext_port->flags.status_lock = 0;
+    ext_port->flags.req_in_flight = 0;
     // Request port handling
     port_set_actions(ext_port, PORT_ACTION_HANDLE);
     return ESP_OK;
@@ -1425,6 +1430,7 @@ static esp_err_t port_req_process(void *port_hdl)
     EXT_PORT_CHECK(port_hdl != NULL, ESP_ERR_INVALID_ARG);
     ext_port_t *ext_port = (ext_port_t *)port_hdl;
 
+    ext_port->flags.req_in_flight = 0;
     if (ext_port->flags.status_outdated) {
         port_set_actions(ext_port, PORT_ACTION_GET_STATUS);
     } else {
@@ -1579,7 +1585,14 @@ esp_err_t ext_port_process(void)
         * - further request of new port status via get_status(), except PORT_ACTION_GET_STATUS itself
         */
         if (action_flags & PORT_ACTION_GET_STATUS) {
-            port_request_status(ext_port);
+            if (ext_port->flags.req_in_flight) {
+                // The parent Hub has a single control transfer and a request for this port is still in
+                // flight (e.g. the Hub reported a change while the port was being handled by an enumeration
+                // retry). Its completion reads the port status again, so don't submit a second request.
+                ESP_LOGD(EXT_PORT_TAG, "Port%d status request deferred, request in flight", ext_port->constant.port_num);
+            } else {
+                port_request_status(ext_port);
+            }
         } else if (action_flags & PORT_ACTION_POWER) {
             handle_power(ext_port);
         } else if (action_flags & PORT_ACTION_RESET) {
