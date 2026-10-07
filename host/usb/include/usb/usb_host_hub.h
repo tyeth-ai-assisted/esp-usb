@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include "esp_err.h"
@@ -28,6 +29,12 @@ typedef enum {
  */
 typedef struct {
     uint8_t dev_addr;                   /**< Hub's device address */
+    uint8_t parent_addr;                /**< Address of the hub this hub is attached to, 0 on a root port */
+    uint8_t parent_port;                /**< Port number on the parent hub, 0 on a root port */
+    uint16_t vid;                       /**< idVendor */
+    uint16_t pid;                       /**< idProduct */
+    char manufacturer[32];              /**< Manufacturer string (ASCII, may be empty) */
+    char product[32];                   /**< Product string (ASCII, may be empty) */
     uint8_t num_ports;                  /**< Number of downstream ports */
     uint8_t power_switching;            /**< wHubCharacteristics power switching mode (usb_host_hub_power_switching_t, 3 also means none) */
     bool compound;                      /**< Hub is part of a compound device */
@@ -43,6 +50,23 @@ typedef struct {
     uint16_t port_change;               /**< wPortChange (USB 2.0 Table 11-22) */
     bool user_power_off;                /**< Port was powered off with usb_host_hub_port_power() */
 } usb_host_hub_port_info_t;
+
+/**
+ * @brief List the addresses of the configured external hubs
+ *
+ * @note Hubs are managed by the USB Host Library and are not reported to clients
+ *       through USB_HOST_CLIENT_EVENT_NEW_DEV
+ * @note Must not be called from the task that calls usb_host_lib_handle_events()
+ *
+ * @param[out] addrs    Hub device addresses
+ * @param[in] max       Capacity of addrs
+ * @param[out] count    Number of hubs (may exceed max)
+ * @return
+ *    - ESP_OK:                 List returned
+ *    - ESP_ERR_TIMEOUT:        The USB Host Library did not process the request in time
+ *    - ESP_ERR_NOT_SUPPORTED:  Hub support is disabled
+ */
+esp_err_t usb_host_hub_list(uint8_t *addrs, size_t max, size_t *count);
 
 /**
  * @brief Get information about an external hub
@@ -97,6 +121,14 @@ esp_err_t usb_host_hub_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_hos
  *    - see usb_host_hub_get_info() for other errors
  */
 esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enable);
+
+/**
+ * @brief Log the state of the hub driver, external hubs, pending ports and the
+ *        enumerator at WARNING level (diagnostics for stuck hubs)
+ *
+ * @note Must not be called from the task that calls usb_host_lib_handle_events()
+ */
+esp_err_t usb_host_hub_debug_dump(void);
 
 #ifdef __cplusplus
 }

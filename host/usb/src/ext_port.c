@@ -801,13 +801,30 @@ static void handle_recycle(ext_port_t *ext_port)
 
     ext_port->flags.waiting_recycle = 0;
 
-    if (ext_port->flags.status_lock) {
-        // Port is awaiting the status
+    if (ext_port->flags.status_lock || ext_port->flags.status_outdated) {
+        // A port request is in flight (status read, or a feature request whose
+        // completion triggers a status read): the port is handled when it completes
         return;
     }
 
-    // Port should not have any changes
-    assert(ext_port->status.wPortChange.val == 0);
+    if (ext_port->status.wPortChange.val != 0) {
+        // The port changed again (e.g. the device reconnected or the parent hub
+        // switched its power) while waiting for the device to be freed. Handle the
+        // pending changes now instead of recycling from a stale state.
+        ESP_LOGD(EXT_PORT_TAG, "Port%d has changes on recycle (0x%04x)",
+                 ext_port->constant.port_num, ext_port->status.wPortChange.val);
+        if (ext_port->flags.user_power_off) {
+            ext_port->state = USB_PORT_STATE_POWERED_OFF;
+        } else if (ext_port->state != USB_PORT_STATE_DISABLED) {
+            ext_port->state = USB_PORT_STATE_DISCONNECTED;
+        }
+        if (ext_port->flags.is_gone) {
+            handle_complete(ext_port);
+        } else {
+            handle_port(ext_port);
+        }
+        return;
+    }
     switch (ext_port->state) {
     case USB_PORT_STATE_DISABLED:
         // We don't need to do anything, as port will be handled after completing USB_FEATURE_PORT_ENABLE
@@ -1084,6 +1101,11 @@ static esp_err_t port_active(void *port_hdl)
 
     ext_port->flags.has_enum_device = 1;
 
+    if (!ext_port->flags.in_pending_list || ext_port->flags.waiting_recycle ||
+            ext_port->action_flags != 0) {
+        // Port is not waiting for its device to become active
+        return ESP_OK;
+    }
     return handle_complete(ext_port);
 }
 
@@ -1453,10 +1475,16 @@ esp_err_t ext_port_get_port_num(ext_port_hdl_t port_hdl, uint8_t *port1)
     return ESP_OK;
 }
 
-bool ext_port_has_pending(void)
+bool ext_port_has_pending(void *context)
 {
     EXT_PORT_CHECK(p_ext_port_driver != NULL, false);
-    return !TAILQ_EMPTY(&p_ext_port_driver->single_thread.pending_tailq);
+    ext_port_t *port = NULL;
+    TAILQ_FOREACH(port, &p_ext_port_driver->single_thread.pending_tailq, tailq_entry) {
+        if (port->constant.context == context) {
+            return true;
+        }
+    }
+    return false;
 }
 
 esp_err_t ext_port_get_info(ext_port_hdl_t port_hdl, usb_port_status_t *status, bool *user_power_off)
@@ -1467,4 +1495,21 @@ esp_err_t ext_port_get_info(ext_port_hdl_t port_hdl, usb_port_status_t *status, 
     *status = ext_port->status;
     *user_power_off = ext_port->flags.user_power_off;
     return ESP_OK;
+}
+
+void ext_port_debug_dump(void)
+{
+    if (p_ext_port_driver == NULL) {
+        return;
+    }
+    ext_port_t *port = NULL;
+    int n = 0;
+    TAILQ_FOREACH(port, &p_ext_port_driver->single_thread.pending_tailq, tailq_entry) {
+        ESP_LOGW(EXT_PORT_TAG, "pending[%d]: hub=%p port%d state=%d dev=%d flags=0x%08"PRIx32
+                 " actions=0x%"PRIx32" status=%04x/%04x power_req=%d",
+                 n++, port->constant.context, port->constant.port_num, port->state, port->dev_state,
+                 port->flags.val, port->action_flags,
+                 port->status.wPortStatus.val, port->status.wPortChange.val, port->power_req);
+    }
+    ESP_LOGW(EXT_PORT_TAG, "%d port(s) pending", n);
 }

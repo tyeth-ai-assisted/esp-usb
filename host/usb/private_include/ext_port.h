@@ -183,13 +183,19 @@ void *ext_port_get_context(ext_port_hdl_t port_hdl);
  *    - ESP_OK if the port number was successfully returned
  */
 /**
- * @brief Whether any port is waiting to be handled
+ * @brief Whether any port of a hub is waiting to be handled
  *
  * @note Must be called from the USB Host processing task
  *
- * @return true if at least one port is in the pending list
+ * @param[in] context   Parent hub handle of the ports
+ * @return true if at least one port of that hub is in the pending list
  */
-bool ext_port_has_pending(void);
+bool ext_port_has_pending(void *context);
+
+/**
+ * @brief Log the ports waiting to be handled (diagnostics)
+ */
+void ext_port_debug_dump(void);
 
 /**
  * @brief Get the last known status of the port

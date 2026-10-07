@@ -285,6 +285,13 @@ esp_err_t ext_hub_port_get_speed(ext_hub_handle_t ext_hub_hdl, uint8_t port_num,
  *    - ESP_OK if control transfer was successfully submitted
  */
 /**
+ * @brief List the addresses of the configured external hubs
+ *
+ * @note Must be called from the USB Host processing task
+ */
+esp_err_t ext_hub_user_list(uint8_t *addrs, size_t max, size_t *count);
+
+/**
  * @brief Get information about a configured external hub
  *
  * @note Must be called from the USB Host processing task
@@ -310,6 +317,13 @@ esp_err_t ext_hub_user_get_port_info(uint8_t dev_addr, uint8_t port_num, usb_hos
  *    - ESP_OK:                 Power change started
  */
 esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enable);
+
+/**
+ * @brief Log the state of every external hub and pending port (diagnostics)
+ *
+ * @note Must be called from the USB Host processing task
+ */
+void ext_hub_debug_dump(void);
 
 esp_err_t ext_hub_request(ext_port_hdl_t port_hdl, ext_port_parent_request_data_t *data, void *user_arg);
 

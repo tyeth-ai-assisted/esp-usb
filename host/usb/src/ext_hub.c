@@ -1832,6 +1832,48 @@ static esp_err_t user_get_configured_hub(uint8_t dev_addr, ext_hub_dev_t **ext_h
     return ESP_OK;
 }
 
+static void user_str_desc(const usb_str_desc_t *desc, char *out, size_t out_size)
+{
+    size_t o = 0;
+    if (desc != NULL && desc->bLength >= 2) {
+        for (size_t i = 0; i < (size_t)(desc->bLength - 2) / 2 && o + 1 < out_size; i++) {
+            uint16_t c = desc->wData[i];
+            if (c == 0) {
+                break;    /* some devices NUL-pad their strings */
+            }
+            out[o++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+        }
+    }
+    out[o] = '\0';
+}
+
+esp_err_t ext_hub_user_list(uint8_t *addrs, size_t max, size_t *count)
+{
+    EXT_HUB_ENTER_CRITICAL();
+    EXT_HUB_CHECK_FROM_CRIT(p_ext_hub_driver != NULL, ESP_ERR_NOT_ALLOWED);
+    size_t n = 0;
+    ext_hub_dev_t *hub = NULL;
+    TAILQ_FOREACH(hub, &p_ext_hub_driver->dynamic.ext_hubs_tailq, dynamic.tailq_entry) {
+        if (hub->single_thread.state == EXT_HUB_STATE_CONFIGURED) {
+            if (n < max) {
+                addrs[n] = hub->constant.dev_addr;
+            }
+            n++;
+        }
+    }
+    TAILQ_FOREACH(hub, &p_ext_hub_driver->dynamic.ext_hubs_pending_tailq, dynamic.tailq_entry) {
+        if (hub->single_thread.state == EXT_HUB_STATE_CONFIGURED) {
+            if (n < max) {
+                addrs[n] = hub->constant.dev_addr;
+            }
+            n++;
+        }
+    }
+    EXT_HUB_EXIT_CRITICAL();
+    *count = n;
+    return ESP_OK;
+}
+
 esp_err_t ext_hub_user_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
 {
     EXT_HUB_CHECK(info != NULL, ESP_ERR_INVALID_ARG);
@@ -1841,6 +1883,25 @@ esp_err_t ext_hub_user_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
         return ret;
     }
     const usb_hub_descriptor_t *desc = ext_hub_dev->constant.hub_desc;
+    memset(info, 0, sizeof(*info));
+
+    usb_device_info_t dev_info;
+    if (usbh_dev_get_info(ext_hub_dev->constant.dev_hdl, &dev_info) == ESP_OK) {
+        if (dev_info.parent.dev_hdl != NULL) {
+            usb_device_info_t parent_info;
+            if (usbh_dev_get_info(dev_info.parent.dev_hdl, &parent_info) == ESP_OK) {
+                info->parent_addr = parent_info.dev_addr;
+                info->parent_port = dev_info.parent.port_num;
+            }
+        }
+        user_str_desc(dev_info.str_desc_manufacturer, info->manufacturer, sizeof(info->manufacturer));
+        user_str_desc(dev_info.str_desc_product, info->product, sizeof(info->product));
+    }
+    const usb_device_desc_t *dev_desc = NULL;
+    if (usbh_dev_get_desc(ext_hub_dev->constant.dev_hdl, &dev_desc) == ESP_OK && dev_desc != NULL) {
+        info->vid = dev_desc->idVendor;
+        info->pid = dev_desc->idProduct;
+    }
     info->dev_addr = dev_addr;
     info->num_ports = ext_hub_dev->single_thread.maxchild;
     info->power_switching = desc->wHubCharacteristics.power_switching;
@@ -1887,10 +1948,10 @@ esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
     ext_port_hdl_t port_hdl = ext_hub_dev->constant.ports[port_num - 1];
     EXT_HUB_CHECK(port_hdl != NULL, ESP_ERR_INVALID_STATE);
 
-    // The control pipe of the hub must be idle: no port of any hub being handled
+    // The hub's control pipe must be idle: none of its ports being handled
     if (ext_hub_dev->single_thread.user_op ||
             ext_hub_dev->single_thread.stage != EXT_HUB_STAGE_IDLE ||
-            ext_port_has_pending()) {
+            ext_port_has_pending(ext_hub_dev)) {
         return ESP_ERR_NOT_FINISHED;
     }
 
@@ -1900,4 +1961,23 @@ esp_err_t ext_hub_user_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
         ext_hub_dev->single_thread.user_op = false;
     }
     return ret;
+}
+
+void ext_hub_debug_dump(void)
+{
+    ext_hub_dev_t *hub = NULL;
+    TAILQ_FOREACH(hub, &p_ext_hub_driver->dynamic.ext_hubs_tailq, dynamic.tailq_entry) {
+        ESP_LOGW(EXT_HUB_TAG, "hub %p addr=%d state=%d stage=%s maxchild=%d flags=0x%"PRIx32
+                 " actions=0x%"PRIx32" in_ep_armed=%d user_op=%d deferred=0x%"PRIx32,
+                 hub, hub->constant.dev_addr, hub->single_thread.state,
+                 ext_hub_stage_strings[hub->single_thread.stage], hub->single_thread.maxchild,
+                 hub->dynamic.flags.val, hub->dynamic.action_flags, hub->single_thread.in_ep_armed,
+                 hub->single_thread.user_op, hub->single_thread.deferred_status);
+    }
+    TAILQ_FOREACH(hub, &p_ext_hub_driver->dynamic.ext_hubs_pending_tailq, dynamic.tailq_entry) {
+        ESP_LOGW(EXT_HUB_TAG, "hub %p addr=%d (pending processing) stage=%s actions=0x%"PRIx32,
+                 hub, hub->constant.dev_addr, ext_hub_stage_strings[hub->single_thread.stage],
+                 hub->dynamic.action_flags);
+    }
+    ext_port_debug_dump();
 }

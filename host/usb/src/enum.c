@@ -221,6 +221,17 @@ static bool pending_uid_enqueue(unsigned int uid)
     return true;
 }
 
+static bool pending_uid_contains(unsigned int uid)
+{
+    for (unsigned int i = 0; i < p_enum_driver->single_thread.pending_count; i++) {
+        unsigned int idx = (p_enum_driver->single_thread.pending_head + i) % ENUM_PENDING_QUEUE_LEN;
+        if (p_enum_driver->single_thread.pending_uids[idx] == uid) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool pending_uid_dequeue(unsigned int *uid)
 {
     if (p_enum_driver->single_thread.pending_count == 0) {
@@ -1252,6 +1263,23 @@ esp_err_t enum_start(unsigned int uid)
 esp_err_t enum_proceed(unsigned int uid)
 {
     ENUM_CHECK(p_enum_driver != NULL, ESP_ERR_INVALID_STATE);
+    // Only the second reset waits for this notification (root ports complete the
+    // reset synchronously, still in SECOND_RESET). A port can also report a
+    // completed reset when its status is re-read after a change on the hub;
+    // processing in any other stage would run the FSM out of sequence
+    // (ENUM_STAGE_IDLE aborts).
+    const enum_stage_t stage = p_enum_driver->single_thread.stage;
+    if (stage != ENUM_STAGE_SECOND_RESET && stage != ENUM_STAGE_SECOND_RESET_COMPLETE) {
+        ESP_LOGD(ENUM_TAG, "Reset completion of uid %u while not resetting (stage %s)", uid,
+                 enum_stage_strings[stage]);
+        if ((stage != ENUM_STAGE_IDLE && p_enum_driver->single_thread.node_uid == uid) ||
+                pending_uid_contains(uid)) {
+            // Being (or about to be) enumerated: its port completes with the enumeration
+            return ESP_ERR_NOT_FINISHED;
+        }
+        // Not involved in enumeration: the device is already active
+        return ESP_ERR_INVALID_STATE;
+    }
     // Request processing
     p_enum_driver->constant.proc_req_cb(USB_PROC_REQ_SOURCE_ENUM, false, p_enum_driver->constant.proc_req_cb_arg);
     return ESP_OK;
@@ -1384,4 +1412,15 @@ esp_err_t enum_process(void)
     }
 
     return ESP_OK;
+}
+
+void enum_debug_dump(void)
+{
+    if (p_enum_driver == NULL) {
+        return;
+    }
+    ESP_LOGW(ENUM_TAG, "stage=%s uid=%u dev_hdl=%p pending=%u",
+             enum_stage_strings[p_enum_driver->single_thread.stage],
+             p_enum_driver->single_thread.node_uid, p_enum_driver->single_thread.dev_hdl,
+             (unsigned)p_enum_driver->single_thread.pending_count);
 }

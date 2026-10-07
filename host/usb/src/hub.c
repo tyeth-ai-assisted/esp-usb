@@ -6,6 +6,7 @@
 
 #include "sdkconfig.h"
 #include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <sys/queue.h>
 #include "esp_err.h"
@@ -19,6 +20,7 @@
 #include "hcd.h"
 #include "hub.h"
 #include "usbh.h"
+#include "enum.h"
 #include "usb/usb_host_hub.h"
 
 #if ENABLE_USB_HUBS
@@ -67,7 +69,11 @@ typedef enum {
 /**
  * @brief User request to an external hub, handed from the caller's task to hub_process()
  */
+#define HUB_USER_REQ_LIST_MAX           16
+
 typedef enum {
+    HUB_USER_REQ_DEBUG,
+    HUB_USER_REQ_LIST,
     HUB_USER_REQ_INFO,
     HUB_USER_REQ_PORT_INFO,
     HUB_USER_REQ_PORT_POWER,
@@ -87,6 +93,10 @@ typedef struct {
     union {
         usb_host_hub_info_t hub_info;
         usb_host_hub_port_info_t port_info;
+        struct {
+            uint8_t addrs[HUB_USER_REQ_LIST_MAX];
+            size_t count;
+        } list;
     } result;
 } hub_user_req_t;
 
@@ -296,18 +306,29 @@ fail:
     return ret;
 }
 
-static esp_err_t dev_tree_node_reset_completed(ext_hub_handle_t parent, uint8_t port_num)
+/**
+ * @brief Find the device tree node of the device currently on a port
+ *
+ * A node stays in the list until its device is freed, so after a quick
+ * disconnect/reconnect the list can hold the old node and the new one for the
+ * same port. The newest (last inserted) node is the one on the port now.
+ */
+static dev_tree_node_t *dev_tree_node_get_by_port(ext_hub_handle_t parent, uint8_t port_num)
 {
     dev_tree_node_t *dev_tree_node = NULL;
     dev_tree_node_t *dev_tree_iter;
-    // Search the device tree nodes list for a device node with the specified parent
     TAILQ_FOREACH(dev_tree_iter, &p_hub_driver_obj->single_thread.dev_nodes_tailq, tailq_entry) {
         if (dev_tree_iter->parent == parent &&
                 dev_tree_iter->port_num == port_num) {
             dev_tree_node = dev_tree_iter;
-            break;
         }
     }
+    return dev_tree_node;
+}
+
+static esp_err_t dev_tree_node_reset_completed(ext_hub_handle_t parent, uint8_t port_num)
+{
+    dev_tree_node_t *dev_tree_node = dev_tree_node_get_by_port(parent, port_num);
 
     if (dev_tree_node == NULL) {
         ESP_LOGE(HUB_DRIVER_TAG, "Reset completed, but device tree node (port %d) not found", port_num);
@@ -326,16 +347,7 @@ static esp_err_t dev_tree_node_reset_completed(ext_hub_handle_t parent, uint8_t 
 
 static esp_err_t dev_tree_node_dev_gone(ext_hub_handle_t parent, uint8_t port_num)
 {
-    dev_tree_node_t *dev_tree_node = NULL;
-    dev_tree_node_t *dev_tree_iter;
-    // Search the device tree nodes list for a device node with the specified parent
-    TAILQ_FOREACH(dev_tree_iter, &p_hub_driver_obj->single_thread.dev_nodes_tailq, tailq_entry) {
-        if (dev_tree_iter->parent == parent &&
-                dev_tree_iter->port_num == port_num) {
-            dev_tree_node = dev_tree_iter;
-            break;
-        }
-    }
+    dev_tree_node_t *dev_tree_node = dev_tree_node_get_by_port(parent, port_num);
 
     if (dev_tree_node == NULL) {
         ESP_LOGW(HUB_DRIVER_TAG, "Device tree node (port %d): not found", port_num);
@@ -1259,6 +1271,20 @@ static void hub_user_req_process(void)
 
     esp_err_t ret;
     switch (s_user_req.type) {
+    case HUB_USER_REQ_DEBUG: {
+        dev_tree_node_t *node;
+        TAILQ_FOREACH(node, &p_hub_driver_obj->single_thread.dev_nodes_tailq, tailq_entry) {
+            ESP_LOGW(HUB_DRIVER_TAG, "node uid=%u parent=%p port=%d", node->uid, node->parent, node->port_num);
+        }
+        ext_hub_debug_dump();
+        enum_debug_dump();
+        ret = ESP_OK;
+        break;
+    }
+    case HUB_USER_REQ_LIST:
+        ret = ext_hub_user_list(s_user_req.result.list.addrs, HUB_USER_REQ_LIST_MAX,
+                                &s_user_req.result.list.count);
+        break;
     case HUB_USER_REQ_INFO:
         ret = ext_hub_user_get_info(s_user_req.dev_addr, &s_user_req.result.hub_info);
         break;
@@ -1340,7 +1366,9 @@ static esp_err_t hub_user_request(hub_user_req_type_t type, uint8_t dev_addr, ui
         ret = ESP_ERR_TIMEOUT;
     }
     if (ret == ESP_OK && out != NULL) {
-        if (type == HUB_USER_REQ_INFO) {
+        if (type == HUB_USER_REQ_LIST) {
+            memcpy(out, &s_user_req.result.list, sizeof(s_user_req.result.list));
+        } else if (type == HUB_USER_REQ_INFO) {
             *(usb_host_hub_info_t *)out = s_user_req.result.hub_info;
         } else if (type == HUB_USER_REQ_PORT_INFO) {
             *(usb_host_hub_port_info_t *)out = s_user_req.result.port_info;
@@ -1397,6 +1425,29 @@ esp_err_t hub_process(void)
 // ------------------------------------ Public hub API ---------------------------------------------
 // -------------------------------------------------------------------------------------------------
 
+esp_err_t usb_host_hub_list(uint8_t *addrs, size_t max, size_t *count)
+{
+#if ENABLE_USB_HUBS
+    HUB_DRIVER_CHECK(count != NULL && (addrs != NULL || max == 0), ESP_ERR_INVALID_ARG);
+    struct {
+        uint8_t addrs[HUB_USER_REQ_LIST_MAX];
+        size_t count;
+    } list;
+    esp_err_t ret = hub_user_request(HUB_USER_REQ_LIST, 0, 0, false, &list);
+    if (ret == ESP_OK) {
+        size_t n = list.count < max ? list.count : max;
+        if (n > HUB_USER_REQ_LIST_MAX) {
+            n = HUB_USER_REQ_LIST_MAX;
+        }
+        memcpy(addrs, list.addrs, n);
+        *count = list.count;
+    }
+    return ret;
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
+}
+
 esp_err_t usb_host_hub_get_info(uint8_t dev_addr, usb_host_hub_info_t *info)
 {
 #if ENABLE_USB_HUBS
@@ -1421,6 +1472,15 @@ esp_err_t usb_host_hub_port_power(uint8_t dev_addr, uint8_t port_num, bool enabl
 {
 #if ENABLE_USB_HUBS
     return hub_user_request(HUB_USER_REQ_PORT_POWER, dev_addr, port_num, enable, NULL);
+#else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif // ENABLE_USB_HUBS
+}
+
+esp_err_t usb_host_hub_debug_dump(void)
+{
+#if ENABLE_USB_HUBS
+    return hub_user_request(HUB_USER_REQ_DEBUG, 0, 0, false, NULL);
 #else
     return ESP_ERR_NOT_SUPPORTED;
 #endif // ENABLE_USB_HUBS

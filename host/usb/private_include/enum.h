@@ -151,6 +151,11 @@ esp_err_t enum_cancel(unsigned int uid);
  */
 esp_err_t enum_process(void);
 
+/**
+ * @brief Log the enumeration state (diagnostics)
+ */
+void enum_debug_dump(void);
+
 #ifdef __cplusplus
 }
 #endif

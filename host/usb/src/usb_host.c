@@ -423,7 +423,11 @@ static void hub_event_callback(hub_event_data_t *event_data, void *arg)
         enum_start(event_data->connected.uid);
         break;
     case HUB_EVENT_RESET_COMPLETED:
-        ESP_ERROR_CHECK(enum_proceed(event_data->reset_completed.uid));
+        if (enum_proceed(event_data->reset_completed.uid) == ESP_ERR_INVALID_STATE) {
+            // The device is not being enumerated, it is already active: let its
+            // port finish handling instead of waiting for an enumeration
+            hub_node_active(event_data->reset_completed.uid);
+        }
         break;
     case HUB_EVENT_DISCONNECTED:
         // Cancel enumeration process
