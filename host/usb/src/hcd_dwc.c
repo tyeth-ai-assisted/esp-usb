@@ -529,6 +529,17 @@ static esp_err_t _pipe_cmd_flush(pipe_t *pipe);
  */
 static esp_err_t _pipe_cmd_clear(pipe_t *pipe);
 
+/**
+ * @brief Reset a halted pipe's data toggle so that its next transaction uses DATA0
+ *
+ * Required after a ClearFeature(ENDPOINT_HALT), SetConfiguration or SetInterface (USB 2.0 9.4.5), which reset the
+ * device's data toggle for the endpoint. Control pipes are not supported, as their PIDs are set per stage.
+ *
+ * @param pipe Pipe object
+ * @return esp_err_t
+ */
+static esp_err_t _pipe_cmd_reset_toggle(pipe_t *pipe);
+
 // ------------------------ Port ---------------------------
 
 /**
@@ -2006,6 +2017,26 @@ exit:
     return ret;
 }
 
+static esp_err_t _pipe_cmd_reset_toggle(pipe_t *pipe)
+{
+    esp_err_t ret;
+    if (pipe->ep_char.type == USB_DWC_XFER_TYPE_CTRL) {
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto exit;
+    }
+    // The channel must not be active while its PID is changed, so the pipe must be halted
+    if (pipe->state != HCD_PIPE_STATE_HALTED) {
+        ret = ESP_ERR_INVALID_STATE;
+        goto exit;
+    }
+    // Each pipe owns its channel and the channel's HCTSIZ.PID carries the toggle across transfers (it is the
+    // starting PID in descriptor DMA mode and is updated by the controller), so resetting it here is sufficient.
+    usb_dwc_hal_chan_set_pid(pipe->chan_obj, 0);
+    ret = ESP_OK;
+exit:
+    return ret;
+}
+
 // ----------------------- Public --------------------------
 
 esp_err_t hcd_pipe_alloc(hcd_port_handle_t port_hdl, const hcd_pipe_config_t *pipe_config, hcd_pipe_handle_t *pipe_hdl)
@@ -2219,6 +2250,13 @@ esp_err_t hcd_pipe_command(hcd_pipe_handle_t pipe_hdl, hcd_pipe_cmd_t command)
         ret = _pipe_cmd_clear(pipe);
         break;
     }
+    case HCD_PIPE_CMD_RESET_TOGGLE: {
+        ret = _pipe_cmd_reset_toggle(pipe);
+        break;
+    }
+    default:
+        ret = ESP_ERR_INVALID_ARG;
+        break;
     }
     pipe->cs_flags.pipe_cmd_processing = 0;
     HCD_EXIT_CRITICAL();

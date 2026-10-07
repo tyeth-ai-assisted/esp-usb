@@ -97,6 +97,7 @@ typedef enum {
     USBH_EP_CMD_HALT,           /**< Halt an active endpoint. Any currently executing URB will be canceled. Enqueued URBs are left untouched */
     USBH_EP_CMD_FLUSH,          /**< Can only be called when halted. Will cause all enqueued URBs to be canceled */
     USBH_EP_CMD_CLEAR,          /**< Causes a halted endpoint to become active again. Any enqueued URBs will being executing.*/
+    USBH_EP_CMD_RESET_TOGGLE,   /**< Can only be called when halted, on a non-control endpoint. The next transaction uses DATA0 */
 } usbh_ep_cmd_t;
 
 /**

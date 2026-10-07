@@ -651,6 +651,36 @@ esp_err_t usb_host_endpoint_flush(usb_device_handle_t dev_hdl, uint8_t bEndpoint
  */
 esp_err_t usb_host_endpoint_clear(usb_device_handle_t dev_hdl, uint8_t bEndpointAddress);
 
+/**
+ * @brief Reset the data toggle of a particular endpoint to DATA0
+ *
+ * A ClearFeature(ENDPOINT_HALT) request resets the device's data toggle for that endpoint (USB 2.0 section 9.4.5),
+ * and so do SetConfiguration and SetInterface for the endpoints they affect. The host's toggle must be reset too, or
+ * the first packet after the request is dropped as a retransmission. Call this after such a request completes.
+ *
+ * usb_host_endpoint_clear() does not touch the data toggle, so halt/flush/clear can still be used to abort transfers
+ * without a toggle reset. A typical stall recovery is:
+ * usb_host_endpoint_halt() -> usb_host_endpoint_flush() -> ClearFeature(ENDPOINT_HALT) control transfer ->
+ * usb_host_endpoint_reset_toggle() -> usb_host_endpoint_clear()
+ *
+ * - The device must have been opened by a client
+ * - The endpoint must be part of an interface claimed by a client
+ * - The endpoint must be a bulk, interrupt or isochronous endpoint
+ * - The endpoint must have been halted (either through a transfer error, or usb_host_endpoint_halt())
+ *
+ * @note This function can block
+ * @param[in] dev_hdl Device handle
+ * @param[in] bEndpointAddress Endpoint address
+ *
+ * @return
+ *    - ESP_OK: Data toggle reset, the next transaction on the endpoint uses DATA0
+ *    - ESP_ERR_INVALID_ARG: Invalid argument
+ *    - ESP_ERR_NOT_FOUND: Endpoint address not found
+ *    - ESP_ERR_NOT_SUPPORTED: Endpoint is a control endpoint
+ *    - ESP_ERR_INVALID_STATE: Endpoint is not halted
+ */
+esp_err_t usb_host_endpoint_reset_toggle(usb_device_handle_t dev_hdl, uint8_t bEndpointAddress);
+
 // ------------------------------------------------ Asynchronous I/O ---------------------------------------------------
 
 /**
