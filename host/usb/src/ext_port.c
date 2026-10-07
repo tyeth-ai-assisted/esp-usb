@@ -751,6 +751,21 @@ static void handle_port_state(ext_port_t *ext_port)
                 ext_port->dev_state = PORT_DEV_NOT_PRESENT;
                 port_event(ext_port, EXT_PORT_DISCONNECTED);
                 ext_port->flags.waiting_recycle = 1;
+            } else if (port_has_connection(ext_port) && !ext_port->flags.waiting_recycle) {
+                // The device went away, the port was recycled, and another device connected before the
+                // port left the enabled state, so that connection change was consumed without starting an
+                // enumeration. Treat it as a new connection now, otherwise the port stays connected and idle
+                // until the next change. While a recycle is still pending the old device has not been freed
+                // yet: the recycle handles the connection then, so it must not be reset here.
+                ESP_LOGW(EXT_PORT_TAG, "Port%d reconnected while still marked enabled, resetting", ext_port->constant.port_num);
+                ext_port->dev_reset_attempts = 1;
+                if (!ext_port->in_retry_list) {
+                    ext_port->enum_retries = 0;
+                }
+                ext_port->flags.has_enum_device = 0;
+                new_state = USB_PORT_STATE_RESETTING;
+                port_set_feature(ext_port, USB_FEATURE_PORT_RESET);
+                need_handling = true;
             } else {
                 // Error state
                 ESP_LOGE(EXT_PORT_TAG, "Port%d enabled, but doesn't have a device", ext_port->constant.port_num);
