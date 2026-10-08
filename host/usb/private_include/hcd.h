@@ -540,6 +540,26 @@ urb_t *hcd_urb_dequeue(hcd_pipe_handle_t pipe_hdl);
  */
 esp_err_t hcd_urb_abort(urb_t *urb);
 
+/**
+ * @brief Cancel one URB enqueued to a pipe, if it has not started executing
+ *
+ * Like hcd_urb_abort(), but reports whether the URB was retired, and checks that it belongs to the given pipe.
+ * - A pending URB (not yet filled into a transfer buffer) is moved to the done queue with
+ *   USB_TRANSFER_STATUS_CANCELED and can then be dequeued. Other URBs on the pipe are not affected.
+ * - An URB that is in flight (filled into one of the pipe's transfer buffers) is not affected: the caller must halt
+ *   and flush the pipe to retire it, which also retires every other URB enqueued to the pipe.
+ *
+ * @param[in] pipe_hdl Pipe handle
+ * @param[in] urb URB to cancel
+ *
+ * @return
+ *    - ESP_OK: URB was pending and is now done (canceled), ready to be dequeued
+ *    - ESP_ERR_NOT_FINISHED: URB is in flight; halt and flush the pipe to retire it
+ *    - ESP_ERR_INVALID_STATE: URB is not enqueued to this pipe, or has already completed (it will be or has been
+ *                             dequeued as usual)
+ */
+esp_err_t hcd_urb_cancel_pending(hcd_pipe_handle_t pipe_hdl, urb_t *urb);
+
 #ifdef __cplusplus
 }
 #endif

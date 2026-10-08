@@ -1779,3 +1779,32 @@ esp_err_t usbh_dev_abort_ctrl(usb_device_handle_t dev_hdl)
     }
     return ESP_OK;
 }
+
+esp_err_t usbh_dev_cancel_ctrl_urb(usb_device_handle_t dev_hdl, urb_t *urb)
+{
+    USBH_CHECK(dev_hdl != NULL && urb != NULL, ESP_ERR_INVALID_ARG);
+    device_t *dev_obj = (device_t *)dev_hdl;
+    uint32_t action_flags;
+
+    esp_err_t ret = hcd_urb_cancel_pending(dev_obj->constant.default_pipe, urb);
+    if (ret == ESP_OK) {
+        // The URB never reached the bus: deliver just that one. URBs ahead of it are untouched.
+        action_flags = DEV_ACTION_EP0_DEQUEUE;
+    } else if (ret == ESP_ERR_NOT_FINISHED) {
+        // The URB is on the bus (e.g. the device NAKs a stage forever). The DWC channel cannot drop one URB from
+        // its buffers, so retire everything on EP0 as an EP0 error does, then make EP0 active again. The device
+        // resynchronises on the next SETUP (USB 2.0 8.5.3).
+        action_flags = DEV_ACTION_EP0_FLUSH | DEV_ACTION_EP0_DEQUEUE | DEV_ACTION_EP0_CLEAR;
+    } else {
+        // Already done: its callback runs as usual
+        return ret;
+    }
+
+    USBH_ENTER_CRITICAL();
+    bool call_proc_req_cb = _dev_set_actions(dev_obj, action_flags);
+    USBH_EXIT_CRITICAL();
+    if (call_proc_req_cb) {
+        p_usbh_obj->constant.proc_req_cb(USB_PROC_REQ_SOURCE_USBH, false, p_usbh_obj->constant.proc_req_cb_arg);
+    }
+    return ESP_OK;
+}

@@ -758,6 +758,33 @@ esp_err_t usb_host_transfer_submit(usb_transfer_t *transfer);
  */
 esp_err_t usb_host_transfer_submit_control(usb_host_client_handle_t client_hdl, usb_transfer_t *transfer);
 
+/**
+ * @brief Cancel a control transfer
+ *
+ * Retires a control transfer previously submitted with usb_host_transfer_submit_control() that has not completed,
+ * e.g. because the device NAKs one of its stages indefinitely (the host library does not enforce timeout_ms).
+ * The transfer completes with USB_TRANSFER_STATUS_CANCELED through its callback, from the client's
+ * usb_host_client_handle_events(), so the transfer object must not be freed or resubmitted before then.
+ *
+ * - A transfer still queued behind another control transfer is retired on its own.
+ * - A transfer already on the bus can only be retired by halting and flushing the device's EP0: every control transfer
+ *   then queued to that device (from any client) completes with USB_TRANSFER_STATUS_CANCELED too, and EP0 is then
+ *   made active again. The device resynchronises on the next SETUP packet.
+ * - While EP0 is being flushed, usb_host_transfer_submit_control() to that device can return ESP_ERR_INVALID_STATE
+ *   for a short time; callers may retry.
+ *
+ * @note Call this from the task that handles the client's events. It does not block.
+ *
+ * @param[in] client_hdl Client handle that submitted the transfer
+ * @param[in] transfer Transfer to cancel
+ *
+ * @return
+ *    - ESP_OK: Cancellation requested; the callback follows
+ *    - ESP_ERR_INVALID_ARG: Invalid argument (not a control transfer)
+ *    - ESP_ERR_INVALID_STATE: Transfer is not in flight, or has already completed (its callback runs as usual)
+ */
+esp_err_t usb_host_transfer_cancel_control(usb_host_client_handle_t client_hdl, usb_transfer_t *transfer);
+
 #ifdef __cplusplus
 }
 #endif

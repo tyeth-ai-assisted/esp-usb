@@ -730,6 +730,26 @@ esp_err_t usbh_dev_submit_ctrl_urb(usb_device_handle_t dev_hdl, urb_t *urb);
 esp_err_t usbh_dev_abort_ctrl(usb_device_handle_t dev_hdl);
 
 /**
+ * @brief Cancel one control transfer submitted to a device's EP0
+ *
+ * - If the URB has not started executing, only that URB is retired.
+ * - If it is in flight, EP0 is halted, flushed and made active again (as usbh_dev_abort_ctrl()): every control
+ *   transfer then enqueued to the device completes, the others with USB_TRANSFER_STATUS_CANCELED too.
+ *
+ * Retired URBs complete with USB_TRANSFER_STATUS_CANCELED through the usual control transfer callback, from
+ * usbh_process(). This function does not block and must not be called from an ISR.
+ *
+ * @param[in] dev_hdl Device handle
+ * @param[in] urb Control transfer URB submitted with usbh_dev_submit_ctrl_urb()
+ * @return
+ *    - ESP_OK: Cancellation requested
+ *    - ESP_ERR_INVALID_ARG: Invalid argument
+ *    - ESP_ERR_INVALID_STATE: URB is not enqueued to the device's EP0 or has already completed (its callback
+ *                             runs as usual)
+ */
+esp_err_t usbh_dev_cancel_ctrl_urb(usb_device_handle_t dev_hdl, urb_t *urb);
+
+/**
  * @brief Enqueue a URB to an endpoint
  *
  * The URB will remain enqueued until it completes (successfully or errors out). Use usbh_ep_dequeue_urb() to dequeue

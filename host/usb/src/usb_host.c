@@ -1943,3 +1943,18 @@ submit_err:
     urb_obj->usb_host_inflight = false;
     return ret;
 }
+
+esp_err_t usb_host_transfer_cancel_control(usb_host_client_handle_t client_hdl, usb_transfer_t *transfer)
+{
+    HOST_CHECK(client_hdl != NULL && transfer != NULL, ESP_ERR_INVALID_ARG);
+    HOST_CHECK(transfer->device_handle != NULL, ESP_ERR_INVALID_ARG);
+    HOST_CHECK((transfer->bEndpointAddress & USB_B_ENDPOINT_ADDRESS_EP_NUM_MASK) == 0, ESP_ERR_INVALID_ARG);
+
+    urb_t *urb_obj = __containerof(transfer, urb_t, transfer);
+    // usb_host_inflight is cleared by the submitting client's usb_host_client_handle_events() just before the
+    // callback, so this check is exact when called from that client's task
+    if (!urb_obj->usb_host_inflight || urb_obj->usb_host_client != (void *)client_hdl) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return usbh_dev_cancel_ctrl_urb(transfer->device_handle, urb_obj);
+}

@@ -2897,6 +2897,40 @@ urb_t *hcd_urb_dequeue(hcd_pipe_handle_t pipe_hdl)
     return urb;
 }
 
+esp_err_t hcd_urb_cancel_pending(hcd_pipe_handle_t pipe_hdl, urb_t *urb)
+{
+    pipe_t *pipe = (pipe_t *)pipe_hdl;
+    esp_err_t ret;
+
+    HCD_ENTER_CRITICAL();
+    if (urb->hcd_ptr != (void *)pipe) {
+        // Not enqueued to this pipe, or already dequeued
+        ret = ESP_ERR_INVALID_STATE;
+    } else if (urb->hcd_var == URB_HCD_STATE_PENDING) {
+        // Not filled into a buffer yet: retire just this URB
+        TAILQ_REMOVE(&pipe->pending_urb_tailq, urb, tailq_entry);
+        pipe->num_urb_pending--;
+        TAILQ_INSERT_TAIL(&pipe->done_urb_tailq, urb, tailq_entry);
+        pipe->num_urb_done++;
+        urb->hcd_var = URB_HCD_STATE_DONE;
+        urb->transfer.actual_num_bytes = 0;
+        urb->transfer.status = USB_TRANSFER_STATUS_CANCELED;
+        for (int i = 0; i < urb->transfer.num_isoc_packets; i++) {
+            urb->transfer.isoc_packet_desc[i].actual_num_bytes = 0;
+            urb->transfer.isoc_packet_desc[i].status = USB_TRANSFER_STATUS_CANCELED;
+        }
+        ret = ESP_OK;
+    } else if (urb->hcd_var == URB_HCD_STATE_INFLIGHT) {
+        // In a transfer buffer (executing, or filled and next to execute): only a halt + flush can retire it
+        ret = ESP_ERR_NOT_FINISHED;
+    } else {
+        // Already done, waiting to be dequeued
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    HCD_EXIT_CRITICAL();
+    return ret;
+}
+
 esp_err_t hcd_urb_abort(urb_t *urb)
 {
     HCD_ENTER_CRITICAL();
