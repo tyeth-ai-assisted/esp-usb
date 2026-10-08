@@ -785,6 +785,32 @@ esp_err_t usb_host_transfer_submit_control(usb_host_client_handle_t client_hdl, 
  */
 esp_err_t usb_host_transfer_cancel_control(usb_host_client_handle_t client_hdl, usb_transfer_t *transfer);
 
+/**
+ * @brief Cancel a bulk, interrupt or isochronous transfer that has not started executing
+ *
+ * Retires a transfer previously submitted with usb_host_transfer_submit() that is still queued on its endpoint
+ * behind other transfers (for example an IN transfer the device has not answered, which the host library never
+ * times out). The transfer completes with USB_TRANSFER_STATUS_CANCELED through its callback, from the client's
+ * usb_host_client_handle_events(), so the transfer object must not be freed or resubmitted before then. Other
+ * transfers queued on the endpoint are not affected.
+ *
+ * A transfer already in one of the endpoint's transfer buffers (executing, or next to execute) cannot be retired on
+ * its own: the function returns ESP_ERR_NOT_FINISHED and the caller may halt and flush the endpoint instead
+ * (usb_host_endpoint_halt() and usb_host_endpoint_flush()), which retires every transfer queued on it.
+ *
+ * @note Call this from the task that handles the client's events. It does not block.
+ *
+ * @param[in] transfer Transfer to cancel
+ *
+ * @return
+ *    - ESP_OK: Transfer retired; its callback follows
+ *    - ESP_ERR_NOT_FINISHED: Transfer is in flight; halt and flush its endpoint to retire it
+ *    - ESP_ERR_INVALID_ARG: Invalid argument (a control transfer, or no device handle)
+ *    - ESP_ERR_NOT_FOUND: The endpoint is not allocated (interface not claimed)
+ *    - ESP_ERR_INVALID_STATE: Transfer is not in flight, or has already completed (its callback runs as usual)
+ */
+esp_err_t usb_host_transfer_cancel(usb_transfer_t *transfer);
+
 #ifdef __cplusplus
 }
 #endif

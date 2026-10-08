@@ -779,6 +779,28 @@ esp_err_t usbh_ep_enqueue_urb(usbh_ep_handle_t ep_hdl, urb_t *urb);
  */
 esp_err_t usbh_ep_dequeue_urb(usbh_ep_handle_t ep_hdl, urb_t **urb_ret);
 
+/**
+ * @brief Cancel one URB enqueued to an endpoint, if it has not started executing
+ *
+ * - If the URB is still pending on the endpoint's pipe (not filled into a transfer buffer), only that URB is
+ *   retired: it completes with USB_TRANSFER_STATUS_CANCELED and the endpoint's callback is run with
+ *   USBH_EP_EVENT_URB_DONE so it can be dequeued as usual. Other URBs on the endpoint are not affected.
+ * - If it is in flight (in one of the pipe's transfer buffers) nothing is changed: the caller must halt and flush
+ *   the endpoint with usbh_ep_command(), which retires every URB enqueued to it.
+ *
+ * This function does not block and must not be called from an ISR.
+ *
+ * @param[in] ep_hdl Endpoint handle
+ * @param[in] urb URB enqueued with usbh_ep_enqueue_urb()
+ *
+ * @return
+ *    - ESP_OK: URB retired; dequeue it from the endpoint's callback
+ *    - ESP_ERR_NOT_FINISHED: URB is in flight; halt and flush the endpoint to retire it
+ *    - ESP_ERR_INVALID_ARG: Invalid argument
+ *    - ESP_ERR_INVALID_STATE: URB is not enqueued to this endpoint, or has already completed
+ */
+esp_err_t usbh_ep_cancel_urb(usbh_ep_handle_t ep_hdl, urb_t *urb);
+
 #ifdef __cplusplus
 }
 #endif

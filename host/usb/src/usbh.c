@@ -1762,6 +1762,20 @@ esp_err_t usbh_ep_dequeue_urb(usbh_ep_handle_t ep_hdl, urb_t **urb_ret)
     return ESP_OK;
 }
 
+esp_err_t usbh_ep_cancel_urb(usbh_ep_handle_t ep_hdl, urb_t *urb)
+{
+    USBH_CHECK(ep_hdl != NULL && urb != NULL, ESP_ERR_INVALID_ARG);
+
+    endpoint_t *ep_obj = (endpoint_t *)ep_hdl;
+    esp_err_t ret = hcd_urb_cancel_pending(ep_obj->constant.pipe_hdl, urb);
+    if (ret == ESP_OK) {
+        // The URB is on the pipe's done queue, as after a completion, but the HCD has not run the pipe callback
+        // for it. Deliver it the same way so the endpoint's owner dequeues it and runs the transfer callback.
+        ep_obj->constant.ep_cb((usbh_ep_handle_t)ep_obj, USBH_EP_EVENT_URB_DONE, ep_obj->constant.ep_cb_arg, false);
+    }
+    return ret;
+}
+
 esp_err_t usbh_dev_abort_ctrl(usb_device_handle_t dev_hdl)
 {
     USBH_CHECK(dev_hdl != NULL, ESP_ERR_INVALID_ARG);
